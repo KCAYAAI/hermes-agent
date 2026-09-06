@@ -109,7 +109,7 @@ def test_conversion_preserves_schema_maps_and_instance_data(placement, data):
             assert params["properties"]["payload"] == final["properties"]["payload"]
             assert "pattern" in params["properties"] and "enum" in params["properties"]
     assert schema == original
-    assert tool.inputSchema == original
+    assert tool.model_dump(by_alias=True)["inputSchema"] == original
 
 
 @pytest.mark.parametrize("keyword,container", [
@@ -159,7 +159,7 @@ def test_repairs_only_schema_children(keyword, container):
             assert all(not validator.is_valid({"payload": value}) for value in invalid)
         assert wrapped == before
         assert schema == original
-        assert tool.inputSchema == original
+        assert tool.model_dump(by_alias=True)["inputSchema"] == original
         return
     if container == "constraint":
         # Required names may be declared by a parent/peer, or not declared at all.
@@ -213,7 +213,7 @@ def test_repairs_only_schema_children(keyword, container):
             assert all(not Draft7Validator(final).is_valid(value) for value in invalid)
             assert tools == before
         assert schema == original
-        assert tool.inputSchema == original
+        assert tool.model_dump(by_alias=True)["inputSchema"] == original
         return
     literal = {"anyOf": [{"const": "a"}, {"const": "b"}]}
     child = {"properties": {"required": {"type": "string"},
@@ -262,4 +262,4 @@ def test_repairs_only_schema_children(keyword, container):
         if keyword == "dependencies":
             assert value_out["required"] == ["properties"]
     assert schema == original
-    assert tool.inputSchema == original
+    assert tool.model_dump(by_alias=True)["inputSchema"] == original
