@@ -1151,7 +1151,7 @@ def _slack_ignored_channels_from_gateway_config(config: Any, adapter: Any = None
     if raw is None:
         # Top-level ``slack.ignored_channels`` arrives via the plugin's YAML→env bridge, not PlatformConfig.extra
         # (#46925); scoped read so a secondary never inherits the default profile's list (first-writer env).
-        from gateway.authz_mixin import _platform_gate_env
+        from gateway.platforms._shared import platform_gate_env as _platform_gate_env
         raw = _platform_gate_env("SLACK_IGNORED_CHANNELS") or None
     return _csv_or_list_to_set(raw)
 
@@ -1250,18 +1250,10 @@ def _build_gateway_agent_history(
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             agent_history.append(entry)
 
-    # Strip interrupted tool-call tails so the LLM doesn't re-execute tools killed mid-flight.
-    agent_history = strip_interrupted_tool_tails(agent_history)
-
-    # Strip a dangling assistant(tool_calls) tail (SIGKILL-mid-tool-call); else the model re-issues it forever.
-    # Strip a dangling assistant(tool_calls) tail with no tool answers — the signature of a SIGKILL
-    # mid-tool-call (e.g. the tool itself ran `docker restart`/`kill` and took the gateway down before the
-    # result was persisted). Without this the model re-issues the unanswered call on resume and loops the
-    # restart forever (#49201).
-    agent_history = strip_dangling_tool_call_tail(agent_history)
-
-    # Strip expired dangerous-confirmation phrases; replayed, a follow-up could read as a fresh confirmation.
-    agent_history = strip_stale_dangerous_confirmations(agent_history, now=time.time())
+    # Keep gateway resume byte-identical to the TUI resume and send paths. The
+    # canonicalizer owns interrupted-block, dangling-tail, and stale-confirmation
+    # cleanup together so a middle-of-history rewrite cannot break the prefix cache.
+    agent_history = canonicalize_replay_history(agent_history)
 
     observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
@@ -1334,9 +1326,9 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 # Tool output may hold literal MEDIA: examples (docs, logs); only deliberate media producers may auto-append.
 _AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image_generate"}
 
-# Replay-tail sanitization lives in agent/replay_cleanup.py so every resume surface shares one implementation.
-from agent.replay_cleanup import (  # noqa: E402
-    strip_interrupted_tool_tails, strip_dangling_tool_call_tail, strip_stale_dangerous_confirmations)
+# Replay-history canonicalization lives in agent/replay_cleanup.py so every resume
+# surface and the send path share one implementation.
+from agent.replay_cleanup import canonicalize_replay_history  # noqa: E402
 
 
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
@@ -1808,18 +1800,25 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     Under multiplex, run it once per served profile inside that profile's ``_profile_runtime_scope`` and
     carry the scope into the executor thread with ``copy_context()`` (the same shape as
     ``_run_in_executor_with_context``). See #95518.
+
+    No gateway run can complete a browser OAuth flow (nobody watches its stdout; on Windows its
+    DEVNULL stdin even passes ``isatty``), so discovery runs with interactive OAuth suppressed — the
+    same gate the CLI's background discovery uses. An expired token then parks the server with an
+    actionable ``hermes mcp login`` warning instead of opening an authorize tab.
     """
+    from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
     loop = asyncio.get_running_loop()
-    if not getattr(config, "multiplex_profiles", False):
-        await loop.run_in_executor(None, discover_mcp_tools)
-        return
-    for profile_name, profile_home in _multiplex_profile_homes(config):
-        try:
-            with _profile_runtime_scope(Path(profile_home)):
-                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
-        except Exception:
-            logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
+    with suppress_interactive_oauth():
+        if not getattr(config, "multiplex_profiles", False):
+            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            return
+        for profile_name, profile_home in _multiplex_profile_homes(config):
+            try:
+                with _profile_runtime_scope(Path(profile_home)):
+                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            except Exception:
+                logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
@@ -2090,7 +2089,8 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
 from gateway.config import (
     ChannelOverride, Platform, GatewayConfig, PlatformConfig, _getenv, load_gateway_config)
 from gateway.session import (
-    AsyncSessionStore, SessionStore, SessionSource, SessionContext, build_session_key)
+    AsyncSessionStore, SessionStore, SessionSource, SessionContext, build_session_key,
+    profile_from_session_key_namespace)
 # Telegram topic routing (#22773, regression fixed #52060): a
 # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is ambiguous — a forum-style topic in a
 # private chat and a genuine Bot API channel Direct-Messages topic share the same shape and need OPPOSITE
@@ -2382,10 +2382,13 @@ def _try_resolve_fallback_provider() -> dict | None:
             return None
         for entry in fb_list:
             try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
+                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"), explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry))
+                # Named custom entries resolve to the bare "custom" billing class; persist the configured
+                # identity so UI/billing rows match the manual-switch path (#98739).
+                runtime["provider"] = effective_runtime_provider(entry, runtime)
                 # Log the config `provider`, not the runtime category (Ollama would log "openrouter").
                 logger.info(
                     # Log the literal `provider` key from config, not the resolved runtime category — an
@@ -2870,7 +2873,8 @@ _PROFILE_ID_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key (``agent:{ns}:{platform}:{chat_type}:{chat_id}[:{extra}...]``).
 
-    ``{ns}`` is ``main`` for the default profile or a named-profile id (profile ids match
+    ``{ns}`` is ``main`` for the default profile, ``main~`` for a profile literally named ``main``
+    (``gateway.session._session_key_namespace``), or a named-profile id (profile ids match
     ``[a-z0-9][a-z0-9_-]{0,63}`` — never contain ``:`` — so a plain split stays unambiguous).
     For group/channel sessions the suffix may be a user_id, not a thread_id, so ``thread_id``
     is omitted. Named profiles are reported as ``profile``; ``main`` keys keep their historical
@@ -2880,11 +2884,11 @@ def _parse_session_key(session_key: str) -> "dict | None":
     if (
         len(parts) >= 5
         and parts[0] == "agent"
-        and (parts[1] == "main" or _PROFILE_ID_KEY_RE.match(parts[1]))
+        and (parts[1] in ("main", "main~") or _PROFILE_ID_KEY_RE.match(parts[1]))
     ):
         result = {"platform": parts[2], "chat_type": parts[3], "chat_id": parts[4]}
         if parts[1] != "main":
-            result["profile"] = parts[1]
+            result["profile"] = profile_from_session_key_namespace(parts[1])
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
@@ -4547,6 +4551,7 @@ def _start_gateway_housekeeping(
     """Background thread for gateway-only periodic chores (NOT cron). Separate from the cron trigger
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
+    from gateway.run_profile_reconcile import _mcp_config_reconciler
     chores: list[tuple[int, str, Any]] = []
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
@@ -4565,7 +4570,8 @@ def _start_gateway_housekeeping(
         (60, "Org sync pull tick", _housekeeping_org_skill_sync),
         (60, "Auto-archive tick", _housekeeping_auto_archive),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
-        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim)]
+        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
+        (1, "MCP config reconcile", _mcp_config_reconciler(runner))]
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0

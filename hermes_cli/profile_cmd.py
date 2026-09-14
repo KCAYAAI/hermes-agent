@@ -165,31 +165,6 @@ def _source_profile_dir(source_label: str) -> Path:
     return source_dir
 
 
-def _clone_channels_refusal(source_label: str) -> Optional[str]:
-    """``--clone-channels`` is refused when a live multiplexer already serves the source: the
-    duplicate adapter would be parked at once (same explanation the migrate preflight gives)."""
-    from hermes_cli.gateway_multiplex_served import recorded_served_profiles
-    from hermes_cli.profile_channels import channel_platforms_configured
-    from hermes_cli.profiles import normalize_profile_name
-    served = recorded_served_profiles()
-    if not served or len(served) < 2 or normalize_profile_name(source_label) not in {
-        normalize_profile_name(p) for p in served
-    }:
-        return None
-    try:
-        platforms = channel_platforms_configured(_source_profile_dir(source_label))
-    except FileNotFoundError:
-        return None
-    if not platforms:
-        return None
-    return (
-        f"Error: --clone-channels would copy {', '.join(platforms)} from '{source_label}', which the running "
-        "multiplexed gateway already serves: the bot can only belong to one profile, so the copy would be "
-        "parked as a duplicate credential. Clone without --clone-channels and give the new profile its own bot "
-        "(hermes -p <name> setup), or route its chats with gateway.profile_routes instead."
-    )
-
-
 def _print_channel_clone_notice(name: str, source_label: str, clone_channels: bool, clone_flag: str) -> None:
     from hermes_cli.profile_channels import (
         channel_platforms_configured, format_stripped_notice, shared_channel_credentials,
@@ -224,10 +199,6 @@ def _profile_create(args):
     clone_config = clone or clone_from is not None
     cloned = clone_config or clone_all
     source_label = clone_from or get_active_profile_name()
-    if clone_channels and cloned:
-        refusal = _clone_channels_refusal(source_label)
-        if refusal:
-            _die(refusal)
     try:
         profile_dir = create_profile(
             name=name, clone_from=clone_from, clone_all=clone_all, clone_config=clone_config,
@@ -245,11 +216,17 @@ def _profile_create(args):
         _print_channel_clone_notice(name, source_label, clone_channels, "--clone-all" if clone_all else "--clone")
         # Auto-clone Honcho config for the new profile (only with clone operations)
         try:
-            from plugins.memory.honcho.cli import clone_honcho_for_profile
-            if clone_honcho_for_profile(name):
-                print(f"Honcho config cloned (peer: {name})")
+            from plugins.memory.honcho.cli import ConfigWriteRefused, clone_honcho_for_profile
         except Exception:
-            pass  # Honcho plugin not installed or not configured
+            clone_honcho_for_profile = None  # Honcho plugin not installed
+        if clone_honcho_for_profile is not None:
+            try:
+                if clone_honcho_for_profile(name):
+                    print(f"Honcho config cloned (peer: {name})")
+            except ConfigWriteRefused as e:
+                print(f"Honcho config not cloned: {e}")
+            except Exception:
+                pass  # Honcho not configured
     else:
         # Fresh profiles only: clones already carry the source's (user-curated) skills.
         result = seed_profile_skills(profile_dir)

@@ -33,10 +33,14 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from agent.retry_utils import parse_retry_after_seconds
-from agent.secret_scope import UnscopedSecretError, get_secret
+from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms._shared import (
+    apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
+    extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
+    platform_gate_env as _scoped_gate_env, send_error
+)
 from gateway.platforms.helpers import MessageDeduplicator
-from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error, yaml_env_setter as _yaml_env_setter
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
@@ -458,9 +462,9 @@ def _render_inline_elements(elements: list) -> str:
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
-    """Render ``rich_text`` blocks to readable lines, preserving quotes, lists and code.
-    Quoted/forwarded content lives in nested ``rich_text_quote`` elements that the event's plain
-    ``text`` field omits."""
+    """Render ``rich_text`` blocks to readable lines (quotes, lists, code) and ``table`` blocks as
+    pipe rows. Quoted/forwarded content lives in nested ``rich_text_quote`` elements and pasted
+    tables in ``table`` blocks; the event's plain ``text`` field omits both."""
     if not blocks:
         return ""
     parts: list[str] = []
@@ -498,9 +502,76 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
                 _append_line(_render_inline_elements([elem]), quote_depth, bullet)
 
     for block in blocks:
-        if (block or {}).get("type") == "rich_text":
+        block_type = (block or {}).get("type")
+        if block_type == "rich_text":
             _walk_elements(block.get("elements", []))
+        elif block_type == "table":
+            table_text = _render_slack_table_block(block)
+            if table_text:
+                parts.append(table_text)
+
     return "\n".join(parts)
+
+
+#: Cap on a single rendered pasted-table projection. Slack lets a user paste
+#: arbitrarily large spreadsheets; the projection must not grow unboundedly
+#: with whatever was pasted. 20k chars comfortably covers real tables while
+#: staying well under Slack's own 40k message ceiling.
+_SLACK_TABLE_MAX_CHARS = 20_000
+
+
+def _collect_slack_table_cell_text(value: Any) -> str:
+    """Collect the text leaves in a Slack table cell's raw/rich-text subtree.
+
+    Cells arrive as ``raw_text`` objects or nested rich-text trees depending
+    on formatting; walking every ``text`` leaf keeps formatted cells intact
+    without enumerating Slack's cell schema.
+    """
+    parts: list[str] = []
+
+    def _visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        text = node.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        for child in node.values():
+            _visit(child)
+
+    _visit(value)
+    return " ".join(p for p in parts if p).strip()
+
+
+def _render_slack_table_block(
+    block: dict, max_chars: int = _SLACK_TABLE_MAX_CHARS
+) -> str:
+    """Render a Slack ``table`` block as ``cell | cell | cell`` lines.
+
+    Slack represents a **pasted table** as ``blocks[]`` entries of type ``table`` (usually nested
+    inside ``attachments[].blocks[]``). It appears in neither the message ``text`` nor the file
+    list, so without this projection the agent receives the sentence before the table and
+    nothing else.
+    """
+    rows = block.get("rows") if isinstance(block, dict) else None
+    if not isinstance(rows, list):
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        rendered = " | ".join(_collect_slack_table_cell_text(cell) for cell in row)
+        if rendered.strip(" |"):
+            lines.append(rendered)
+    text = "\n".join(lines)
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[: max_chars - 20].rstrip() + "\n[table truncated]"
+    return text
 
 
 def _extract_text_from_slack_attachments(attachments: list) -> str:
@@ -595,7 +666,15 @@ def _extract_additional_text_from_slack_blocks(
         for match in _SLACK_FENCED_CODE_RE.finditer(primary_text or "")}
     parts: list[str] = []
     for block in blocks or []:
-        if (block or {}).get("type") != "rich_text":
+        block_type = (block or {}).get("type")
+        if block_type == "table":
+            # A top-level ``table`` block never appears in the plain text and the JSON serializer
+            # drops ``rows``, so this is the only path that surfaces a pasted table.
+            table_text = _render_slack_table_block(block)
+            if table_text:
+                parts.append(table_text)
+            continue
+        if block_type != "rich_text":
             continue
         for element in block.get("elements", []):
             element_type = element.get("type", "")
@@ -625,8 +704,10 @@ _BLOCK_RECURSIVE_KEYS = frozenset(
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
     """Compact, redacted JSON view of non-``rich_text`` Block Kit blocks.
     ``rich_text`` is already rendered into the message text; dumping it here would repeat the
-    author's words with every ``url`` stripped by the allowlist."""
-    inspectable = [block for block in (blocks or []) if (block or {}).get("type") != "rich_text"]
+    author's words with every ``url`` stripped by the allowlist. ``table`` is rendered by
+    :func:`_render_slack_table_block`; the allowlist drops ``rows`` so it would dump as a husk."""
+    inspectable = [
+        block for block in (blocks or []) if (block or {}).get("type") not in ("rich_text", "table")]
     if not inspectable:
         return ""
     def _sanitize(value):
@@ -1644,17 +1725,8 @@ class SlackAdapter(BasePlatformAdapter):
             self._set_fatal_error("missing_dependency", "slack-bolt not installed", retryable=False)
             return False
         raw_token = self.config.token
-        # Scoped secret is authoritative; only an UNSCOPED read falls back to
-        # process env, else a secondary profile inherits the default's app.
-        try:
-            # Multiplex: profile secrets live in the secret scope, not process os.environ. When a scope is
-            # installed (secondary-profile connect), it is AUTHORITATIVE — do not fall through to os.getenv,
-            # or a secondary profile missing SLACK_APP_TOKEN silently inherits the default profile's Socket
-            # Mode app (#59739). Only an UNSCOPED read under multiplex (default-profile startup loop,
-            # background reconnect rebuild) falls back to process env, which is that profile's own.
-            app_token = get_secret("SLACK_APP_TOKEN")
-        except UnscopedSecretError:
-            app_token = os.getenv("SLACK_APP_TOKEN")
+        # Scoped read: a secondary profile missing SLACK_APP_TOKEN must not inherit the default's app (#59739).
+        app_token = _get_scoped_secret("SLACK_APP_TOKEN")
         for env_name, value in (("SLACK_BOT_TOKEN", raw_token), ("SLACK_APP_TOKEN", app_token)):
             if not value:
                 self._fatal_missing_env(env_name)
@@ -1927,6 +1999,13 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         return self._workspace_thread_key(
             self._metadata_team_id(metadata), chat_id, str(thread_ts))
+
+    def native_task_card_destination_supported(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Placement eligibility independent of connection/stream availability."""
+        return self._native_task_card_key(chat_id, reply_to, metadata) is not None
 
     async def send_native_task_card_progress(
         self, chat_id: str, tasks: List[Dict[str, str]], *, title: str = "Hermes is working",
@@ -2576,9 +2655,8 @@ class SlackAdapter(BasePlatformAdapter):
             pass
 
     def _slack_allow_bots(self) -> str:
-        """Return normalized Slack bot-message policy."""
-        # Scoped read: under multiplex os.environ is the DEFAULT profile's bot-admission policy.
-        raw = self.config.extra.get("allow_bots", "") or _get_scoped_secret("SLACK_ALLOW_BOTS", "none")
+        """Return normalized Slack bot-message policy (scoped ``SLACK_ALLOW_BOTS`` → YAML → none)."""
+        raw = _extra_or_secret(self.config.extra, "allow_bots", "SLACK_ALLOW_BOTS", "none")
         value = str(raw).lower().strip()
         if value not in {"none", "mentions", "all"}:
             logger.warning("[Slack] Unknown allow_bots=%r; treating as 'none'", raw)
@@ -2879,6 +2957,11 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
 
+    def format_tool_preview(self, preview) -> str:
+        """Keep compact tool arguments out of mrkdwn emphasis conversion."""
+        # Substitute embedded delimiters in the display text only.
+        return f"`{preview.text.replace('`', 'ˋ')}`"
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn.
         Tables are fenced first; code is protected from later passes; broadcast mentions are escaped
@@ -2978,10 +3061,8 @@ class SlackAdapter(BasePlatformAdapter):
         return await self._react(channel, timestamp, emoji, team_id, remove=True)
 
     def _reactions_enabled(self) -> bool:
-        """Whether message reactions are enabled (``extra.reactions`` / ``SLACK_REACTIONS``)."""
-        configured = self.config.extra.get("reactions")
-        if configured is None:
-            configured = _get_scoped_secret("SLACK_REACTIONS", "true")
+        """Whether message reactions are enabled (scoped ``SLACK_REACTIONS`` → ``extra.reactions`` → on)."""
+        configured = _extra_or_secret(self.config.extra, "reactions", "SLACK_REACTIONS", "true")
         return str(configured).lower() not in {"false", "0", "no"}
 
     def _reacting_target(self, event: MessageEvent) -> Optional[Tuple[str, str, Any]]:
@@ -3990,6 +4071,11 @@ class SlackAdapter(BasePlatformAdapter):
             body = (att_text or att_fallback or "").strip()
             if len(body) > 500:
                 body = body[:497] + "..."
+            # Pasted tables arrive as ``table`` blocks in ``attachments[].blocks[]``, absent from
+            # ``text``/``fallback``/files; without this the agent sees only the sentence before them.
+            nested_text = _extract_text_from_slack_blocks(att.get("blocks") or [])
+            if nested_text and nested_text not in body:
+                body = f"{body}\n{nested_text}".strip() if body else nested_text
             if header:
                 section = f"{header}\n   {body}" if body else header
             elif body:
@@ -5159,7 +5245,7 @@ class SlackAdapter(BasePlatformAdapter):
                     normalized_user_id, exc_info=True)
         # Env-only fallback. Per-profile accessor: under multiplex a scoped miss
         # returns "" rather than leaking the DEFAULT profile's os.environ allowlist.
-        from gateway.authz_mixin import _platform_gate_env as _env
+        _env = _scoped_gate_env
         if _env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
         allowed_ids = {
@@ -5972,9 +6058,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _extra_or_env_flag(self, key: str, env_var: str, *, strip: bool = False) -> bool:
         """Opt-in boolean: ``config.extra[key]`` wins, else ``env_var`` (default false)."""
-        configured = self.config.extra.get(key)
-        if configured is None:
-            configured = _get_scoped_secret(env_var, "false")
+        configured = _extra_or_secret(self.config.extra, key, env_var, "false", blank_is_unset=False)
         if isinstance(configured, str):
             if strip:
                 configured = configured.strip()
@@ -6008,9 +6092,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, key: str, env_var: str, *, coerce_scalar: bool = False) -> set:
         """Channel-ID set from ``config.extra[key]`` (list or CSV) else ``env_var`` CSV.
         ``coerce_scalar`` accepts non-str scalars (a bare numeric YAML value loads as int)."""
-        raw = self.config.extra.get(key)
-        if raw is None:
-            raw = _get_scoped_secret(env_var, "")
+        raw = _extra_or_secret(self.config.extra, key, env_var, "", blank_is_unset=False)
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         if coerce_scalar:
@@ -6073,7 +6155,7 @@ class SlackAdapter(BasePlatformAdapter):
 
 
 # ── Plugin entry point + hooks (register, _standalone_send, interactive_setup,
-# _apply_yaml_config, _is_connected, _build_adapter) ──────────────────────────
+# _apply_yaml_config, _is_connected) ──────────────────────────
 
 
 # Standalone-send cache: user ID -> DM conversation ID, keyed "{token}:{user_id}" (multi-workspace).
@@ -6081,7 +6163,7 @@ class SlackAdapter(BasePlatformAdapter):
 # #3823) Everything below this line was added when the Slack adapter moved from
 # ``gateway/platforms/slack.py`` into this bundled plugin. It mirrors the Discord migration (PR #24356)
 # exactly: a ``register(ctx)`` entry point plus the hook implementations (``_standalone_send``,
-# ``interactive_setup``, ``_apply_yaml_config``, ``_is_connected``, ``_build_adapter``) that replace the
+# ``interactive_setup``, ``_apply_yaml_config``, ``_is_connected``) that replace the
 # per-platform core touchpoints (the ``Platform.SLACK`` elif in ``gateway/run.py``, the ``slack_cfg``
 # YAML→env block in ``gateway/config.py``, the ``_setup_slack`` wizard + ``_PLATFORMS["slack"]`` static dict
 # in ``hermes_cli/{setup,gateway}.py``, and the ``_send_slack`` dispatch in ``tools/send_message_tool.py``).
@@ -6422,20 +6504,19 @@ def _write_slack_manifest_and_instruct() -> None:
 def interactive_setup() -> None:
     """Guide the user through Slack bot setup (manifest, tokens, allowlist, home channel).
     CLI helpers are lazy-imported to keep the plugin's import surface small."""
-    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
+    from hermes_cli.config import remove_env_value, save_env_value
     from hermes_cli.cli_output import (
         prompt, prompt_yes_no, print_header, print_info, print_success, print_warning)
+    from hermes_cli.setup_platforms import declines_reconfigure
 
     print_header("Slack")
-    if get_env_value("SLACK_BOT_TOKEN"):
-        print_info("Slack: already configured")
-        if not prompt_yes_no("Reconfigure Slack?", False):
-            # Still offer a manifest refresh so new commands get registered.
-            if prompt_yes_no(
-                "Regenerate the Slack app manifest with the latest command "
-                "list? (recommended after `hermes update`)", True):
-                _write_slack_manifest_and_instruct()
-            return
+    if declines_reconfigure("Slack", "Reconfigure Slack?", "SLACK_BOT_TOKEN"):
+        # Still offer a manifest refresh so new commands get registered.
+        if prompt_yes_no(
+            "Regenerate the Slack app manifest with the latest command "
+            "list? (recommended after `hermes update`)", True):
+            _write_slack_manifest_and_instruct()
+        return
     for line in _SETUP_STEPS:
         print_info(line)
     print()
@@ -6477,55 +6558,27 @@ def interactive_setup() -> None:
         print_info("Home channel cleared.")
 
 
-_YAML_BOOL_KEYS = (
-    ("require_mention", "SLACK_REQUIRE_MENTION"), ("strict_mention", "SLACK_STRICT_MENTION"),
-    ("ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS"),
-    ("thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION"), ("allow_bots", "SLACK_ALLOW_BOTS"),
-    ("reactions", "SLACK_REACTIONS"), ("disable_dms", "SLACK_DISABLE_DMS"))
-# (yaml key, env var, list-ish types joined with ","); str(value) when not a list.
-_YAML_LIST_KEYS = (
-    ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", list),
-    ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", list),
-    ("reaction_triggers", "SLACK_REACTION_TRIGGERS", (list, tuple, set)),
-    ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", ()),
-    ("allowed_channels", "SLACK_ALLOWED_CHANNELS", list),
-    ("ignored_channels", "SLACK_IGNORED_CHANNELS", list))
+_YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
+    ("require_mention", "SLACK_REQUIRE_MENTION", "lower"), ("strict_mention", "SLACK_STRICT_MENTION", "lower"),
+    ("ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS", "lower"),
+    ("thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION", "lower"), ("allow_bots", "SLACK_ALLOW_BOTS", "lower"),
+    ("reactions", "SLACK_REACTIONS", "lower"), ("disable_dms", "SLACK_DISABLE_DMS", "lower"),
+    ("free_response_channels", "SLACK_FREE_RESPONSE_CHANNELS", "csv"),
+    ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
+    ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),
+    ("allowed_channels", "SLACK_ALLOWED_CHANNELS", "csv"), ("ignored_channels", "SLACK_IGNORED_CHANNELS", "csv"),
+)
 
 
 def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
-    """``apply_yaml_config_fn`` hook: ``slack:`` YAML keys → ``SLACK_*`` env vars (explicit env wins) and
-    ``PlatformConfig.extra`` (extra-first readers; the env write is skipped under a multiplexed
-    secondary profile's scope so its policy never becomes the default profile's).
-
-    Implements the ``apply_yaml_config_fn`` contract (#24849). Mirrors the legacy ``slack_cfg`` block that
-    used to live in ``gateway/config.py::load_gateway_config()`` before this migration.
-    """
-    _set_env = _yaml_env_setter()
-    seeded: dict = {}
-    for key, env in _YAML_BOOL_KEYS:
-        if key in slack_cfg:
-            seeded[key] = slack_cfg[key]  # original type: the shared-key loop already seeded bools as bools
-            _set_env(env, str(slack_cfg[key]).lower())
-    for key, env, list_types in _YAML_LIST_KEYS:
-        val = slack_cfg.get(key)
-        if val is not None:
-            seeded[key] = val
-            if list_types and isinstance(val, list_types):
-                val = ",".join(str(v) for v in val)
-            _set_env(env, str(val))
-    return seeded or None
+    """``apply_yaml_config_fn`` (#24849): ``slack:`` YAML keys → ``SLACK_*`` env (explicit env wins; skipped
+    under a multiplexed secondary profile's scope) + ``PlatformConfig.extra`` (extra-first readers)."""
+    return _apply_yaml_bridge(slack_cfg, _YAML_BRIDGE)
 
 
-def _is_connected(config) -> bool:
-    """Connected when SLACK_BOT_TOKEN is set. Resolved through ``gateway_mod`` at call
-    time (not a bound import) so tests patching ``get_env_value`` take effect."""
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
 
+_is_connected = _env_is_connected("SLACK_BOT_TOKEN")
 
-def _build_adapter(config):
-    """Factory wrapper that constructs SlackAdapter from a PlatformConfig."""
-    return SlackAdapter(config)
 
 
 def register(ctx) -> None:
@@ -6533,7 +6586,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="slack",
         label="Slack",
-        adapter_factory=_build_adapter,
+        adapter_factory=SlackAdapter,
         check_fn=slack_deps_present,
         ensure_deps_fn=check_slack_requirements,
         is_connected=_is_connected,

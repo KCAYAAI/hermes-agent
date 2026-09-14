@@ -24,9 +24,12 @@ from typing import Any, Dict, List, Optional
 
 from urllib.parse import unquote
 
-from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
+from gateway.platforms._shared import (
+    get_scoped_secret as _get_scoped_secret, seed_extra_from_env as _seed_extra_from_env, send_error
+)
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, cache_image_from_url
+from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
@@ -82,13 +85,6 @@ def _send_cmd(chat_id: str, items: list) -> str:
     syntax is a display-name lookup that silently drops unresolved names; json.dumps escapes text."""
     target = f"#{chat_id[6:]}" if chat_id.startswith("group:") else f"@{chat_id}"
     return f"/_send {target} json {json.dumps(items)}"
-
-
-async def _cancel_task(task: Optional[asyncio.Task]) -> None:
-    if task:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
 
 
 class SimplexAdapter(BasePlatformAdapter):
@@ -155,8 +151,8 @@ class SimplexAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
-        await _cancel_task(self._ws_task)
-        await _cancel_task(self._health_task)
+        await cancel_task(self._ws_task)
+        await cancel_task(self._health_task)
         if self._ws:
             with contextlib.suppress(Exception):
                 await self._ws.close()
@@ -592,20 +588,17 @@ def is_connected(config) -> bool:
 
 
 def _env_enablement() -> Optional[dict]:
-    """Seed ``PlatformConfig.extra`` from env BEFORE adapter construction so ``gateway status``
-    reflects env-only setups. ``None`` when not minimally configured; ``home_channel`` becomes
-    a ``HomeChannel`` via the core hook."""
+    """``env_enablement_fn``: seed ``PlatformConfig.extra`` from the profile's env BEFORE adapter
+    construction; ``None`` when ``SIMPLEX_WS_URL`` is unset."""
     ws_url = _get_scoped_secret("SIMPLEX_WS_URL", "").strip()
     if not ws_url:
         return None
-    seed: dict = {"ws_url": ws_url}
-    if auto_accept := _get_scoped_secret("SIMPLEX_AUTO_ACCEPT", "").strip().lower():
-        seed["auto_accept"] = auto_accept not in {"0", "false", "no"}
-    if group_allowed := _get_scoped_secret("SIMPLEX_GROUP_ALLOWED", "").strip():
-        seed["group_allowed"] = group_allowed
-    if home := _get_scoped_secret("SIMPLEX_HOME_CHANNEL", "").strip():
-        seed["home_channel"] = {"chat_id": home, "name": _get_scoped_secret("SIMPLEX_HOME_CHANNEL_NAME", "").strip() or home}
-    return seed
+    seed = _seed_extra_from_env((
+        ("SIMPLEX_AUTO_ACCEPT", "auto_accept", lambda v: v.lower() not in {"0", "false", "no"}),
+        ("SIMPLEX_GROUP_ALLOWED", "group_allowed", None),
+    ), home_env="SIMPLEX_HOME_CHANNEL")
+    return {"ws_url": ws_url, **seed}
+
 
 
 async def _standalone_send(
@@ -645,28 +638,22 @@ _SETUP_PROMPTS = (
 
 
 def interactive_setup() -> None:
-    """Minimal stdin wizard for ``hermes setup gateway`` → SimpleX; writes ``~/.hermes/.env``."""
-    print(
-        "\nSimpleX Chat setup\n------------------\nRequirements:\n"
-        "  1. simplex-chat daemon running (e.g. `simplex-chat -p 5225`).\n"
-        "  2. Python package `websockets` installed (`pip install websockets`).\n")
-    try:
-        from hermes_cli.config import get_env_value, save_env_value
-    except ImportError:
-        print("hermes_cli.config not available; set SIMPLEX_* vars manually in ~/.hermes/.env")
+    """``hermes setup gateway`` → SimpleX wizard (writes ``~/.hermes/.env``); CLI helpers are lazy-imported."""
+    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.cli_output import print_header, print_info, prompt
+    from hermes_cli.setup_platforms import declines_reconfigure
+    print_header("SimpleX Chat")
+    if declines_reconfigure("SimpleX", "Reconfigure SimpleX?", "SIMPLEX_WS_URL"):
         return
-
-    for var, prompt in _SETUP_PROMPTS:
-        existing = get_env_value(var) if callable(get_env_value) else None
-        suffix = " [keep current]" if existing else ""
-        try:
-            value = input(f"{prompt}{suffix}: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            continue
+    for line in ("Requirements:", "  1. simplex-chat daemon running (e.g. `simplex-chat -p 5225`).",
+                 "  2. Python package `websockets` installed (`pip install websockets`)."):
+        print_info(line)
+    for var, question in _SETUP_PROMPTS:
+        suffix = " [keep current]" if get_env_value(var) else ""
+        value = prompt(f"{question}{suffix}")
         if value:
             save_env_value(var, value)
-    print("Done. Make sure the simplex-chat daemon is running before starting the gateway.")
+    print_info("Done. Make sure the simplex-chat daemon is running before starting the gateway.")
 
 
 def register(ctx) -> None:

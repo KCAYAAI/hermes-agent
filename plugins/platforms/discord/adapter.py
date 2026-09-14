@@ -260,6 +260,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import (
     MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets,
 )
+from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
@@ -269,7 +270,10 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
-from gateway.platforms._shared import send_error, yaml_env_setter as _yaml_env_setter
+from gateway.platforms._shared import (
+    env_is_connected as _env_is_connected, extra_or_secret as _extra_or_secret,
+    platform_gate_env as _scoped_gate_env, send_error, yaml_env_setter as _yaml_env_setter
+)
 
 
 async def _read_url_image_with_redirect_guard(
@@ -343,10 +347,7 @@ async def _wait_for_ready_or_bot_exit(
                 raise RuntimeError("Discord bot task exited before ready")
         await ready_task
     finally:
-        if not ready_task.done():
-            ready_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await ready_task
+        await cancel_task(ready_task)
 
 
 def _needs_server_members_intent(
@@ -548,15 +549,6 @@ _GATE_ENV_KEYS = (
 )
 
 
-def _scoped_gate_env(name: str, default: str = "") -> str:
-    """Scope-aware gate env read: profile secret scope first under multiplex."""
-    try:
-        from gateway.authz_mixin import _platform_gate_env
-        return _platform_gate_env(name, default)
-    except Exception:
-        return (os.getenv(name) or default).strip()
-
-
 def _multiplex_active() -> bool:
     """True when the gateway is running in multiplex_profiles mode."""
     try:
@@ -621,9 +613,12 @@ def _build_allowed_mentions(extra: Optional[dict] = None):
     configured = configured if isinstance(configured, dict) else {}
 
     def _b(name: str, key: str, default: bool) -> bool:
-        if (raw := configured.get(key)) is not None:
-            return str(raw).strip().lower() in {"true", "1", "yes", "on"}
-        return _env_bool(name, default)
+        # Explicit (scoped) env → this profile's YAML → safe default; a scoped miss never reads
+        # another profile's bridged env, and an explicit ``=false`` beats ``everyone: true``.
+        raw = _extra_or_secret(configured, key, name, None)
+        if raw is None:
+            return default
+        return raw if isinstance(raw, bool) else str(raw).strip().lower() in {"true", "1", "yes", "on"}
 
     return discord.AllowedMentions(
         everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", "everyone", False),
@@ -1110,25 +1105,43 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             value = _scoped_gate_env(env_key) or None
         return default if value is None or value == "" else value
 
+    def _warn_liveness_config_disabled(self, key: str, raw: Any) -> None:
+        """Warn when a liveness knob value is unusable (#109521).
+
+        Unparsable config (`"15s"`, `nan`, `true`) silently mapped to 0 and turned the whole
+        watchdog off with no log line — indistinguishable from "the watchdog missed it".
+        An explicit ``0`` is an intentional opt-out and stays silent.
+        """
+        logger.warning(
+            "[%s] Discord liveness knob %s=%r is not a usable positive number; "
+            "the websocket liveness probe is disabled by this value",
+            self.name, key, raw,
+        )
+
+    def _liveness_knob(self, key: str, default: Any, cast: type, *, env_key: Optional[str] = None):
+        """Resolve a liveness knob: usable iff finite, >= 0 and exact for ``cast``; else warn and return 0.
+
+        ``0`` is the documented opt-out and stays silent. Bools, unparsable strings, nan/inf,
+        negatives and (for int knobs) fractional values all disable the probe WITH a warning.
+        """
+        raw = self._config_value(key, default, env_key=env_key)
+        try:
+            value = None if isinstance(raw, bool) else float(raw)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and math.isfinite(value) and value >= 0 and cast(value) == value:
+            return cast(value)
+        if value != 0:
+            self._warn_liveness_config_disabled(key, raw)
+        return cast(0)
+
     def _finite_positive_config_float(
         self, key: str, default: float, *, env_key: Optional[str] = None
     ) -> float:
-        """Resolve a finite positive liveness duration; invalid values disable it."""
-        try:
-            value = float(self._config_value(key, default, env_key=env_key))
-        except (TypeError, ValueError):
-            return 0.0
-        return value if math.isfinite(value) and value > 0 else 0.0
+        return self._liveness_knob(key, default, float, env_key=env_key)
 
     def _config_int(self, key: str, default: int, *, env_key: Optional[str] = None) -> int:
-        """Resolve a positive liveness count; invalid values disable it."""
-        value = self._config_value(key, default, env_key=env_key)
-        if isinstance(value, bool):
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        return self._liveness_knob(key, default, int, env_key=env_key)
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits as a retryable fatal so GatewayRunner
@@ -3144,8 +3157,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
         )
 
-
-
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
         """Play auto-TTS audio: in the guild's VC if joined, else as a file attachment."""
         for gid, text_ch_id in self._voice_text_channels.items():
@@ -4553,17 +4564,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
     def _extra_or_env_flag(self, key: str, env_key: str, env_default: str, *, truthy: bool) -> bool:
-        """Boolean from ``config.extra[key]`` (str parsed permissively) else ``env_key``.
-        ``truthy=True`` env values must be in {true,1,yes,on}; ``truthy=False`` env values are on
-        unless in {false,0,no,off} — matching each flag's historical default shape."""
+        """Boolean: explicit scoped ``env_key`` → ``config.extra[key]`` (str parsed permissively) →
+        ``env_default``. ``truthy=True`` values must be in {true,1,yes,on}; ``truthy=False`` values are
+        on unless in {false,0,no,off} — matching each flag's historical default shape."""
         extra = getattr(self.config, "extra", None)
-        configured = extra.get(key) if isinstance(extra, dict) else None
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() not in {"false", "0", "no", "off"}
-            return bool(configured)
-        env = _scoped_gate_env(env_key, env_default).lower()
-        return env in {"true", "1", "yes", "on"} if truthy else env not in {"false", "0", "no", "off"}
+        configured = _extra_or_secret(extra if isinstance(extra, dict) else None, key, env_key, None)
+        if configured is None:
+            configured = env_default
+        if isinstance(configured, bool):
+            return configured
+        text = str(configured).strip().lower()
+        return text in {"true", "1", "yes", "on"} if truthy else text not in {"false", "0", "no", "off"}
 
     def _discord_require_mention(self) -> bool:
         """Return whether Discord channel messages require a bot mention."""
@@ -6852,6 +6863,7 @@ def interactive_setup() -> None:
     from hermes_cli.cli_output import (
         prompt, prompt_yes_no, print_header, print_info, print_success,
     )
+    from hermes_cli.setup_platforms import declines_reconfigure
     def _info_lines(*lines: str) -> None:
         for line in lines:
             print_info(line)
@@ -6861,22 +6873,19 @@ def interactive_setup() -> None:
         print_success("Discord allowlist configured")
 
     print_header("Discord")
-    existing = get_env_value("DISCORD_BOT_TOKEN")
-    if existing:
-        print_info("Discord: already configured")
-        if not prompt_yes_no("Reconfigure Discord?", False):
-            if not get_env_value("DISCORD_ALLOWED_USERS"):
-                print_info(
-                    "⚠️  Discord has no user allowlist. With the fail-closed default, "
-                    "messages are denied unless you configure allowed users, roles, "
-                    "or channels, or set DISCORD_ALLOW_ALL_USERS=true."
-                )
-                if prompt_yes_no("Add allowed users now?", True):
-                    print_info("   To find Discord ID: Enable Developer Mode, right-click name → Copy ID")
-                    allowed_users = prompt("Allowed user IDs (comma-separated)")
-                    if allowed_users:
-                        _save_allowlist(allowed_users)
-            return
+    if declines_reconfigure("Discord", "Reconfigure Discord?", "DISCORD_BOT_TOKEN"):
+        if not get_env_value("DISCORD_ALLOWED_USERS"):
+            print_info(
+                "⚠️  Discord has no user allowlist. With the fail-closed default, "
+                "messages are denied unless you configure allowed users, roles, "
+                "or channels, or set DISCORD_ALLOW_ALL_USERS=true."
+            )
+            if prompt_yes_no("Add allowed users now?", True):
+                print_info("   To find Discord ID: Enable Developer Mode, right-click name → Copy ID")
+                allowed_users = prompt("Allowed user IDs (comma-separated)")
+                if allowed_users:
+                    _save_allowlist(allowed_users)
+        return
     _info_lines(
         "Create a bot at https://discord.com/developers/applications",
         "On Bot → Privileged Gateway Intents, enable:",
@@ -7030,16 +7039,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     return seeded_extra or None
 
 
-def _is_connected(config) -> bool:
-    """Connected when DISCORD_BOT_TOKEN is set.
-    Looks up ``hermes_cli.gateway.get_env_value`` at call time so tests can patch it (ambient env)."""
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("DISCORD_BOT_TOKEN") or "").strip())
+_is_connected = _env_is_connected("DISCORD_BOT_TOKEN")
 
-
-def _build_adapter(config):
-    """Factory wrapper that constructs DiscordAdapter from a PlatformConfig."""
-    return DiscordAdapter(config)
 
 
 def register(ctx) -> None:
@@ -7047,7 +7048,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="discord",
         label="Discord",
-        adapter_factory=_build_adapter,
+        adapter_factory=DiscordAdapter,
         check_fn=discord_deps_present,
         ensure_deps_fn=check_discord_requirements,
         is_connected=_is_connected,
