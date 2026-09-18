@@ -1082,6 +1082,22 @@ class GatewayAdapterLifecycleMixin:
             # Restore persisted /voice state for this bot (primary startup and reconnects do too).
             # See #84872.
             self._sync_voice_mode_state_to_adapter(adapter)
+            # A successful connect must publish the secondary's namespaced state. Some adapters
+            # (including Slack Socket Mode) manage their own transport flag and do not call
+            # BasePlatformAdapter._mark_connected(), so relying on adapter-side publication leaves
+            # every ``<profile>:slack`` entry absent even while the socket is live.
+            degraded = bool(getattr(adapter, "send_path_degraded", False))
+            self._update_platform_runtime_status(
+                f"{profile_name}:{platform.value}",
+                platform_state="retrying" if degraded else "connected",
+                error_code=None,
+                error_message=(
+                    getattr(adapter, "DEGRADED_STATUS_MESSAGE", "Delivery path not confirmed")
+                    if degraded else None
+                ),
+                needs_attention=False,
+                retrying_since=None,
+            )
             for claim in (credential_claim, listener_claim):
                 if claim is not None:
                     claimed[claim] = profile_name

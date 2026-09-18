@@ -77,13 +77,17 @@ def adapter():
     a._app.client = AsyncMock()
     a._app.client.users_info = AsyncMock(
         return_value={
+            "ok": True,
             "user": {
+                "id": "U_HUMAN",
                 "is_bot": False,
+                "is_workflow_bot": False,
                 "profile": {"display_name": "Test User"},
                 "real_name": "Test User",
             }
         }
     )
+    a.set_authorization_check(lambda *_args, **_kwargs: True)
     a._bot_user_id = BOT_USER_ID
     a._running = True
     a.handle_message = AsyncMock()

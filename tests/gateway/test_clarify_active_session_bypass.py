@@ -1,6 +1,9 @@
 """Regression tests for clarify replies while a gateway session is busy."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -139,3 +142,90 @@ async def test_active_session_bypass_uses_profile_namespaced_key_under_multiplex
     assert adapter._pending_messages == {}
 
 
+@pytest.mark.asyncio
+async def test_stale_scoped_clarify_marker_stays_on_inline_resolver_path():
+    """A prompt may resolve after Slack stamps its exact clarify marker but before
+    active-session dispatch. The immutable marker must still reach the runner,
+    which safely drops stale identities, instead of becoming a queued user turn.
+    """
+    _clear_clarify_state()
+    adapter = _ClarifyBypassAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _event("late answer")
+    event.metadata["_hermes_clarify_response_only"] = "already-resolved"
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    adapter._message_handler.assert_awaited_once_with(event)
+    adapter._busy_session_handler.assert_not_awaited()
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_default_profile_busy_handler_uses_routed_runtime_and_transport_authorization(
+    tmp_path,
+):
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    routed_home = tmp_path / "profiles" / "worker"
+    scoped_homes = []
+
+    @asynccontextmanager
+    async def runtime_scope(profile_home):
+        scoped_homes.append(Path(profile_home))
+        yield
+
+    runner._stamp_routed_profile = lambda source: (
+        setattr(source, "profile", "worker") or True)
+    runner._resolve_profile_home_for_source = lambda source: routed_home
+    runner._session_key_for_source = lambda source: f"agent:{source.profile}:busy"
+    runner._handle_active_session_busy_message = AsyncMock(return_value=True)
+    event = _event()
+
+    with patch("gateway.run.get_hermes_home", return_value=tmp_path), patch(
+        "gateway.run._async_profile_runtime_scope", runtime_scope
+    ):
+        handled = await runner._make_default_profile_busy_session_handler()(
+            event, "transport-key")
+
+    assert handled is True
+    assert event.source.profile == "worker"
+    assert event.source._authorization_profile_home == tmp_path
+    assert scoped_homes == [routed_home]
+    runner._handle_active_session_busy_message.assert_awaited_once_with(
+        event, "agent:worker:busy")
+
+
+def test_wire_adapter_handlers_uses_default_profile_busy_wrapper_under_multiplex():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner.session_store = object()
+    runner._busy_text_mode = "queue"
+    runner._make_default_profile_message_handler = MagicMock(
+        return_value="message-handler")
+    runner._make_default_profile_busy_session_handler = MagicMock(
+        return_value="busy-handler")
+    runner._handle_adapter_fatal_error = MagicMock()
+    runner._handle_reaction_event = MagicMock()
+    runner._recover_telegram_topic_thread_id = MagicMock()
+    runner._make_adapter_auth_check = MagicMock(return_value="auth-check")
+    runner._make_default_profile_platform_event_handler = MagicMock(
+        return_value="platform-handler")
+    adapter = MagicMock()
+    adapter.platform = Platform.SLACK
+
+    runner._wire_adapter_handlers(adapter)
+
+    adapter.set_message_handler.assert_called_once_with("message-handler")
+    adapter.set_busy_session_handler.assert_called_once_with("busy-handler")
+    adapter.set_authorization_check.assert_called_once_with("auth-check")

@@ -2282,8 +2282,22 @@ class BasePlatformAdapter(ABC):
             extra["is_bot"] = True
         if thread_id is not None:
             extra["thread_id"] = thread_id
+        call_extra = extra
+        if extra:
+            try:
+                parameters = inspect.signature(self._authorization_check).parameters
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                if not accepts_kwargs:
+                    call_extra = {
+                        key: value for key, value in extra.items() if key in parameters
+                    }
+            except (TypeError, ValueError):
+                pass
         try:
-            result = self._authorization_check(user_id, chat_type, chat_id, **extra)
+            result = self._authorization_check(user_id, chat_type, chat_id, **call_extra)
         except Exception:
             logger.warning("[%s] Authorization check raised for user %s; treating as unknown",
                            self.name, user_id, exc_info=True)
@@ -3811,12 +3825,23 @@ class BasePlatformAdapter(ABC):
         # blocked on Event.wait, message must reach the resolver before being a new turn.
         # See #4926.
         if not cmd and event.allow_gateway_control:
+            # Slack has already authorized and bound this event to one exact
+            # clarify ID. Keep that immutable event on the inline resolver path
+            # even if mutable registry state changes before dispatch. The runner
+            # validates the marker again and safely drops stale identities.
+            _clarify_marker = bool(
+                (event.metadata or {}).get("_hermes_clarify_response_only")
+            )
             try:
                 from tools import clarify_gateway as _clarify_mod
-                _has_text_clarify = _clarify_mod.get_pending_for_session(
-                    session_key, include_choice_prompts=True) is not None
+                _has_text_clarify = _clarify_marker or (
+                    _clarify_mod.get_pending_for_session(
+                        session_key, include_choice_prompts=True
+                    )
+                    is not None
+                )
             except Exception:
-                _has_text_clarify = False
+                _has_text_clarify = _clarify_marker
             if _has_text_clarify:
                 logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
                 try:

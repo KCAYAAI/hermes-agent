@@ -354,11 +354,18 @@ class GatewayInboundMixin:
         """Intercept a reply to a pending clarify prompt; None when the message falls through.
         Free text answers open-ended/"Other" prompts; "2" answers a multi-choice one. Resolved/retained
         replies return "" so adapters don't double-post — the agent produces the next user-facing message."""
+        clarify_marker = str(
+            (event.metadata or {}).get("_hermes_clarify_response_only") or "")
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key, include_choice_prompts=True)
         except Exception:
-            return None
+            return "" if clarify_marker else None
+        if clarify_marker and (
+            _pending_clarify is None
+            or _pending_clarify.clarify_id != clarify_marker
+        ):
+            return ""
         if _pending_clarify is None:
             return None
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
@@ -376,7 +383,18 @@ class GatewayInboundMixin:
         # Slash commands: the user wanted a command, not to answer the clarify. Leave it pending so
         # they can retry; on timeout the agent unblocks with an empty response.
         if not _raw_clarify_reply or _raw_clarify_reply.startswith("/"):
-            return None
+            return "" if clarify_marker else None
+        if clarify_marker:
+            if _clarify_mod.resolve_text_response_for_clarify(
+                clarify_marker, _quick_key, _raw_clarify_reply):
+                logger.info(
+                    "Gateway intercepted scoped clarify text response (session=%s, id=%s)",
+                    _quick_key, clarify_marker)
+                _clarify_adapter = self._adapter_for_source(source)
+                if _clarify_adapter:
+                    with suppress(Exception):
+                        _clarify_adapter.resume_typing_for_chat(source.chat_id)
+            return ""
         _text_outcome = _clarify_mod.attempt_text_response_for_session(_quick_key, _raw_clarify_reply)
         if _text_outcome == _clarify_mod.TEXT_RESOLVED:
             logger.info(
@@ -1190,9 +1208,19 @@ class GatewayInboundMixin:
         Only events that may control the gateway (``allow_gateway_control``) can answer them."""
         if not event.allow_gateway_control:
             return None
-        _reply = self._hm_update_prompt_reply(event, _quick_key)
+        clarify_marker = bool(
+            (event.metadata or {}).get("_hermes_clarify_response_only"))
+        _reply = (
+            await self._hm_clarify_reply(event, source, _quick_key)
+            if clarify_marker
+            else self._hm_update_prompt_reply(event, _quick_key)
+        )
         if _reply is None:
-            _reply = await self._hm_clarify_reply(event, source, _quick_key)
+            _reply = (
+                self._hm_update_prompt_reply(event, _quick_key)
+                if clarify_marker
+                else await self._hm_clarify_reply(event, source, _quick_key)
+            )
         if _reply is None:
             _reply = await self._hm_slash_confirm_reply(event, _quick_key)
         return _reply

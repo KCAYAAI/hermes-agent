@@ -407,7 +407,11 @@ def _run_job_script(
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
+            # Bound the stored failure text: the ledger keeps rows, not bytes, so an unbounded
+            # stdout here is what lets one chatty failing script fill the disk. Redaction above
+            # already ran, so the elided copy is the safe copy.
+            from cron.executions import clip_error_text
+            return False, (clip_error_text("\n".join(parts)) or "")
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"

@@ -178,11 +178,14 @@ class TestProfileRuntimeStatus:
 
 class _SecondaryRecoveryAdapter:
     platform = Platform.DISCORD
+    DEGRADED_STATUS_MESSAGE: str = "Delivery path is not confirmed"
 
     def __init__(self, *, retryable=True):
         self.fatal_error_retryable = retryable
         self.fatal_error_code = "transport_stale" if retryable else "auth_failed"
         self.fatal_error_message = "Gateway transport stale"
+        self.send_path_degraded = False
+        self.DEGRADED_STATUS_MESSAGE = "Delivery path is not confirmed"
         self.connected = False
         self.disconnected = False
 
@@ -326,14 +329,27 @@ class TestSecondaryProfileFatalRecovery:
         assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
 
     @pytest.mark.asyncio
-    async def test_secondary_initial_connect_syncs_voice_mode_state(self, monkeypatch):
-        """#84872: a secondary bot gets its persisted /voice state at INITIAL
-        connect, not only on reconnect."""
+    @pytest.mark.parametrize(
+        ("degraded", "expected_state", "expected_error"),
+        [
+            (False, "connected", None),
+            (True, "retrying", "Secondary delivery path is not confirmed"),
+        ],
+    )
+    async def test_secondary_initial_connect_syncs_voice_and_publishes_status(
+        self, monkeypatch, degraded, expected_state, expected_error
+    ):
+        """A secondary bot gets its persisted /voice state and publishes accurate
+        namespaced health at initial connect, including the degraded-delivery branch."""
         runner = _secondary_recovery_runner()
         adapter = _SecondaryRecoveryAdapter()
+        adapter.send_path_degraded = degraded
+        adapter.DEGRADED_STATUS_MESSAGE = "Secondary delivery path is not confirmed"
         _install_secondary_reconnect_context(monkeypatch, runner, adapter)
         synced = []
+        statuses = []
         runner._sync_voice_mode_state_to_adapter = synced.append
+        runner._update_platform_runtime_status = lambda platform, **kwargs: statuses.append((platform, kwargs))
         monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda h: {})
         monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
         monkeypatch.setattr(runner, "_snapshot_profile_busy_modes", lambda *a, **k: None)
@@ -345,6 +361,16 @@ class TestSecondaryProfileFatalRecovery:
         monkeypatch.setattr(runner, "_connect_initial_adapter_with_timeout", connect)
         assert await runner._start_one_profile_adapters("reviewer", Path("/profiles/reviewer"), {}) == 1
         assert synced == [adapter]
+        assert statuses == [(
+            "reviewer:discord",
+            {
+                "platform_state": expected_state,
+                "error_code": None,
+                "error_message": expected_error,
+                "needs_attention": False,
+                "retrying_since": None,
+            },
+        )]
 
     @pytest.mark.asyncio
     async def test_retryable_secondary_fatal_reconnects_with_its_profile_scope(

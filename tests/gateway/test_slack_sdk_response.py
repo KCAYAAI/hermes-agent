@@ -168,7 +168,10 @@ class TestIdentityResolution:
         adapter = _make_adapter()
         adapter._app.client.users_info = AsyncMock(
             return_value=make_response(
-                {"ok": True, "user": {"is_bot": True, "profile": {}}}
+                {"ok": True, "user": {
+                    "id": "U_PEER_BOT", "is_bot": True,
+                    "is_workflow_bot": False, "profile": {},
+                }}
             )
         )
         assert asyncio.run(adapter._resolve_user_is_bot("U_PEER_BOT")) is True

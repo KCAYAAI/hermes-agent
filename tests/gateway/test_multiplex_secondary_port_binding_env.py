@@ -60,6 +60,22 @@ def test_profile_match_is_token_equality_not_substring(tmp_path, cmdline, expect
 
 
 @pytest.mark.parametrize("cmdline", [
+    "/v/python -m hermes_cli.main -p default gateway run",
+    "/v/python -m hermes_cli.main --profile default gateway run",
+    "/v/python -m hermes_cli.main --profile=default gateway run",
+])
+def test_explicit_default_profile_flag_belongs_to_default_home(tmp_path, cmdline):
+    """The supported ``-p default`` launcher is still the root/default gateway.
+
+    Rejecting every explicit profile flag made the live default multiplexer invisible to
+    Desktop and to served-profile discovery even while all adapters were connected.
+    """
+    from gateway.status import _command_line_belongs_to_profile
+
+    assert _command_line_belongs_to_profile(cmdline, tmp_path) is True
+
+
+@pytest.mark.parametrize("cmdline", [
     "/v/python -m hermes_cli.main --profile=ops gateway run",
     "/v/python -m hermes_cli.main -p ops gateway run",
     "/v/python -m hermes_cli.main --profile ops gateway run",

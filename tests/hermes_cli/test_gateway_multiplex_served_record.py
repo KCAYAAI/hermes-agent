@@ -52,6 +52,22 @@ def test_probe_trusts_live_record_over_cli_side_config(served_root):
     assert named_profile_served_by_running_multiplexer("other") is False
 
 
+def test_probe_accepts_explicit_default_profile_launcher(served_root, monkeypatch):
+    """KC's supervised launcher uses ``-p default`` and must remain discoverable as the
+    default multiplexer rather than looking like an unrelated named-profile gateway."""
+    import gateway.status as status
+    from hermes_cli.gateway import named_profile_served_by_running_multiplexer
+    from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
+
+    real_cmdline = status._read_process_cmdline
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: (
+        "python -m hermes_cli.main -p default gateway run --replace"
+        if pid == os.getpid() else real_cmdline(pid)))
+
+    assert live_default_gateway_pid() == os.getpid()
+    assert named_profile_served_by_running_multiplexer("coder") is True
+
+
 def test_probe_falls_back_to_config_only_without_recorded_key(served_root):
     from hermes_cli.gateway import named_profile_served_by_running_multiplexer
     (served_root / "gateway_state.json").write_text(json.dumps(

@@ -220,6 +220,7 @@ def adapter():
     )
     a._bot_user_id = "U_BOT"
     a._running = True
+    a.set_authorization_check(lambda *_args, **_kwargs: True)
     # Capture events instead of processing them
     a.handle_message = AsyncMock()
     return a
@@ -1799,6 +1800,7 @@ class TestIncomingDocumentHandling:
             async def handle(self, _event):
                 raise AssertionError("gateway handler should not run")
 
+        adapter.set_authorization_check(None)
         adapter._message_handler = Runner().handle
         adapter._app.client.files_info = AsyncMock()
 
@@ -2252,7 +2254,9 @@ class TestMessageRouting:
         adapter._mentioned_threads.add("123.000")
         adapter._app.client.users_info = AsyncMock(
             return_value={
+                "ok": True,
                 "user": {
+                    "id": "U_PEER_BOT",
                     "is_bot": True,
                     "profile": {"display_name": "AIDx Engineer"},
                 }
@@ -3032,6 +3036,7 @@ class TestThreadReplyHandling:
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
         a.handle_message = AsyncMock()
+        a.set_authorization_check(lambda *_args, **_kwargs: True)
         a.set_session_store(mock_session_store)
         return a
 
@@ -3126,7 +3131,7 @@ class TestThreadReplyHandling:
         # Cold-start context carries the parent so the agent sees the ask.
         assert "check this and ask me for run" in msg_event.channel_context
         # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        assert ("T_TEAM", "123.000") in adapter_with_session_store._mentioned_threads
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(
@@ -3252,6 +3257,7 @@ class TestAssistantThreadLifecycle:
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
         a.handle_message = AsyncMock()
+        a.set_authorization_check(lambda *_args, **_kwargs: True)
         a.set_session_store(mock_session_store)
         return a
 
@@ -3338,6 +3344,8 @@ class TestAssistantThreadLifecycle:
     async def test_agent_view_message_preserves_outer_team_and_turn_context(
         self, assistant_adapter
     ):
+        assistant_adapter._team_clients["T_OTHER"] = assistant_adapter._app.client
+        assistant_adapter._team_bot_user_ids["T_OTHER"] = "U_BOT"
         assistant_adapter._app.client.users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Tyler"}}}
         )
@@ -4889,6 +4897,7 @@ class TestThreadImageContext:
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
         a.handle_message = AsyncMock()
+        a.set_authorization_check(lambda *_args, **_kwargs: True)
         a.set_session_store(mock_session_store)
         return a
 
@@ -6066,47 +6075,88 @@ class TestAgentSessionsApiRouting:
         a._app.client = AsyncMock()
         return a
 
-    @pytest.mark.asyncio
-    async def test_typing_uses_agent_sessions_when_supported(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
+    @pytest.fixture(params=["agent", "legacy-sdk", "missing-method"])
+    def status_transport(self, request, monkeypatch):
+        route = request.param
+        monkeypatch.setattr(_slack_mod, "_AGENT_SESSIONS_SUPPORTED", route != "legacy-sdk")
         a = self._adapter()
-        a._app.client.agents_sessions_setStatus = AsyncMock()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="is thinking...",
-        )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        # Explicit transport attributes: an auto-created mock method hides fallback bugs.
+        client = SimpleNamespace(assistant_threads_setStatus=AsyncMock())
+        if route != "missing-method":
+            client.agents_sessions_setStatus = AsyncMock()
+        a._team_clients = {"T_OTHER": a._app.client, "T_TARGET": client}
+        a._channel_team["C123"] = "T_OTHER"
+        agent_api = route == "agent"
+        setter = client.agents_sessions_setStatus if agent_api else client.assistant_threads_setStatus
+        unused = client.assistant_threads_setStatus if agent_api else getattr(
+            client, "agents_sessions_setStatus", None)
+        return a, setter, unused, agent_api
 
+    @pytest.mark.parametrize("configured,live,elapsed,legacy_status", [
+        pytest.param(None, None, 0, "is thinking...", id="default"),
+        pytest.param("is checking…", None, 0, "is checking…", id="configured"),
+        pytest.param("is checking…", "is reading docs…", 0, "is reading docs…", id="live"),
+        pytest.param(None, None, 123, "still working… (2m03s)", id="elapsed"),
+        pytest.param(None, "Waiting for your answer", 0, "Waiting for your answer", id="wait-prose"),
+        pytest.param(None, "suspended", 0, "suspended", id="lifecycle-word-is-prose"),
+    ])
     @pytest.mark.asyncio
-    async def test_typing_falls_back_to_legacy_without_sdk_support(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = False
-        a = self._adapter()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="is thinking...",
+    async def test_typing_lifecycle_preserves_transport_contract(
+        self, status_transport, monkeypatch, configured, live, elapsed, legacy_status,
+    ):
+        a, setter, unused, agent_api = status_transport
+        a.config.typing_status_text = configured
+        a.set_status_text("C123", live)
+        clock = [1000.0]
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: clock[0])
+        metadata = {"thread_id": "171.000", "message_id": "171.500", "slack_team_id": "T_TARGET"}
+
+        await a.send_typing("C123", metadata=metadata)
+        clock[0] += elapsed
+        await a.send_typing("C123", metadata=metadata)
+        # The tracked workspace must win over the conflicting channel map on clear.
+        await a.stop_typing("C123", metadata={"thread_id": "171.000"})
+        await a.send_typing("C123", metadata=metadata)
+
+        typing_status = "processing" if agent_api else legacy_status
+        fresh_status = "processing" if agent_api else live or configured or "is thinking..."
+        assert setter.await_args_list == [
+            call(channel_id="C123", thread_ts="171.000", status=fresh_status),
+            call(channel_id="C123", thread_ts="171.000", status=typing_status),
+            call(channel_id="C123", thread_ts="171.000", status="active" if agent_api else ""),
+            call(channel_id="C123", thread_ts="171.000", status=fresh_status),
+        ]
+        if unused is not None:
+            unused.assert_not_awaited()
+        assert a._app.client.mock_calls == []
+
+    @pytest.mark.parametrize("operation,fail_label", [
+        ("send_typing", "failed"), ("stop_typing", "clear failed"),
+    ])
+    @pytest.mark.asyncio
+    async def test_status_transport_failure_is_nonfatal_and_secret_safe(
+        self, status_transport, caplog, operation, fail_label,
+    ):
+        a, setter, unused, agent_api = status_transport
+        secret = "SYNTHETIC_EXCEPTION_SECRET"
+        setter.side_effect = RuntimeError(f"request credentials: {secret}")
+        caplog.set_level("DEBUG", logger=_slack_mod.__name__)
+
+        await getattr(a, operation)(
+            "C123", metadata={"thread_id": "171.000", "slack_team_id": "T_TARGET"},
         )
 
-    @pytest.mark.asyncio
-    async def test_stop_typing_clears_via_agent_sessions(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
-        a = self._adapter()
-        a._app.client.agents_sessions_setStatus = AsyncMock()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.reset_mock()
-        await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="",
-        )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        setter.assert_awaited_once()
+        if unused is not None:
+            unused.assert_not_awaited()  # API failures must not retry through the legacy endpoint.
+        assert a._app.client.mock_calls == []
+        records = [record for record in caplog.records if record.name == _slack_mod.__name__]
+        assert records
+        assert secret not in caplog.text
+        method = "agents.sessions.setStatus" if agent_api else "assistant.threads.setStatus"
+        assert any(method in record.getMessage() and fail_label in record.getMessage()
+                   and "RuntimeError" in record.getMessage() for record in records)
+        assert all(record.exc_info is None and record.stack_info is None for record in records)
 
     @pytest.mark.asyncio
     async def test_thread_title_uses_agents_sessions_rename(self):

@@ -417,11 +417,11 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     home_lc = str(profile_home).lower().replace("\\", "/")
     if profile_name is not None and profile_name != "default":
         return profile_flag_value(command_lc) == profile_name.lower() or f"hermes_home={home_lc}" in command_lc
-    # Default profile: accept unless argv names another profile (any spelling the CLI pre-parser
-    # accepts, ``--profile=ops`` included -- a substring test let that gateway pass as the default's)
-    # or a conflicting explicit HERMES_HOME= (its absence is not disqualifying -- HERMES_HOME usually
-    # arrives via the env).
-    if profile_flag_value(command_lc) is not None:
+    # Default profile: a supported explicit ``-p default`` still names the root/default home.
+    # Reject every other profile spelling, plus a conflicting explicit HERMES_HOME= (its absence
+    # is not disqualifying because HERMES_HOME normally arrives through the environment).
+    selected_profile = profile_flag_value(command_lc)
+    if selected_profile is not None and selected_profile != "default":
         return False
     return not ("hermes_home=" in command_lc and f"hermes_home={home_lc}" not in command_lc)
 
@@ -823,15 +823,18 @@ def write_runtime_status(
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     multiplex_standalone_reason: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
-    drop_profile_platforms: Optional[str] = None,
+    clear_platforms: bool = False, drop_profile_platforms: Optional[str] = None,
 ) -> None:
-    """Persist gateway runtime health information for diagnostics/status. ``drop_profile_platforms``
-    removes one deleted profile's ``<profile>:<platform>`` entries (hot unroute)."""
+    """Persist gateway runtime health information for diagnostics/status. ``clear_platforms``
+    starts a fresh process with no inherited adapter claims; ``drop_profile_platforms`` removes
+    one deleted profile's ``<profile>:<platform>`` entries (hot unroute)."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()
     payload.setdefault("platforms", {})
+    if clear_platforms:
+        payload["platforms"] = {}
     if clear_profile_platforms or drop_profile_platforms:
         # Secondary-profile entries are keyed ``<profile>:<platform>``. A fresh process must not
         # inherit them or /api/status stays degraded until every old adapter re-emits.

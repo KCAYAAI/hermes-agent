@@ -238,6 +238,24 @@ class TestGatewayRuntimeStatus:
         payload = status.read_runtime_status()
         assert payload["platforms"] == {"telegram": {"state": "connected"}}
 
+    def test_clear_platforms_removes_stale_primary_and_secondary_entries(self, tmp_path, monkeypatch):
+        """A fresh gateway process starts with no proven adapter state. It must not inherit an
+        old primary Feishu entry or old secondary Slack entries from the previous PID."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "platforms": {
+                    "feishu": {"state": "connected", "writer_pid": 111},
+                    "brand:slack": {"state": "connected", "writer_pid": 111},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(clear_platforms=True)
+
+        assert status.read_runtime_status()["platforms"] == {}
+
     def test_clear_profile_platforms_and_write_are_one_atomic_update(
         self, tmp_path, monkeypatch
     ):

@@ -204,6 +204,22 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return json.dumps(selected, ensure_ascii=False) if selected else None
 
 
+def resolve_text_response_for_clarify(
+    clarify_id: str, session_key: str, response: str,
+) -> bool:
+    """Resolve one exact pending clarify, rejecting stale prompt identities."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.session_key != session_key or entry.event.is_set():
+            return False
+        coerced = _coerce_text_response(entry, response)
+        if coerced is None:
+            return False
+        entry.response = coerced
+        entry.event.set()
+        return True
+
+
 def attempt_text_response_for_session(session_key: str, response: str) -> str:
     """Try to resolve the oldest pending clarify from typed text; returns a TEXT_* outcome."""
     entry = get_pending_for_session(session_key, include_choice_prompts=True)

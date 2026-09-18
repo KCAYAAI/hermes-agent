@@ -806,7 +806,7 @@ class GatewayStartupMixin:
             _profile = get_active_profile_name()
             if _profile and _profile != "default":
                 logger.info("Active profile: %s", _profile)
-        _write_runtime_status_quiet(gateway_state="starting", exit_reason=None, clear_profile_platforms=True)
+        _write_runtime_status_quiet(gateway_state="starting", exit_reason=None, clear_platforms=True)
         with _log_suppressed(logging.DEBUG, "gateway health OTLP export startup failed", exc_info=True):
             from hermes_cli.config import load_config
             from agent.monitoring.gateway_health_export import start_gateway_health_export
