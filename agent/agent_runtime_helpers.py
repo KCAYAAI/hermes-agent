@@ -1054,6 +1054,43 @@ def try_recover_primary_transport(
         return False
 
 
+def refresh_codex_cloudflare_transport(agent, classified) -> bool:
+    """Retire a Codex WAF-blocked connection without refreshing or restoring OAuth.
+
+    A fresh connection lets a balancing proxy choose a different outbound; it
+    does not guarantee a new exit IP or bypass a browser challenge. Retire the
+    shared transport using the existing thread-safe lifecycle, never close it
+    while stale streaming workers may still be unwinding.
+    """
+    from agent.error_classifier import FailoverReason
+
+    if (
+        (getattr(agent, "provider", "") or "").strip().lower() != "openai-codex"
+        or classified.status_code != 403
+        or classified.reason != FailoverReason.upstream_blocked
+        or not classified.retryable
+        or not classified.error_context.get("codex_cloudflare_block")
+        or getattr(agent, "_fallback_activated", False)
+    ):
+        return False
+    client_kwargs = getattr(agent, "_client_kwargs", None)
+    if not isinstance(client_kwargs, dict) or not client_kwargs:
+        return False
+    try:
+        if getattr(agent, "client", None) is not None:
+            agent._retire_shared_openai_client(agent.client, reason="codex_cloudflare_403")
+        # The primary snapshot can predate pool rotation. Preserve the CURRENT
+        # identity and client kwargs instead of restoring stale credentials.
+        agent.client = agent._create_openai_client(
+            dict(client_kwargs), reason="codex_cloudflare_403", shared=True,
+        )
+        logger.info("Codex Cloudflare 403: rebuilt transport for the next bounded retry")
+        return True
+    except Exception:
+        logger.warning("Codex Cloudflare transport refresh failed", exc_info=True)
+        return False
+
+
 def _merge_user_content(prev_content: Any, cur_content: Any) -> Any:
     """Merged content for two adjacent user messages (``_UNMERGEABLE`` for unknown shapes):
     string+string joins with a blank line; list sides append as separate blocks."""
