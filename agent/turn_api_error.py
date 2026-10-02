@@ -119,6 +119,11 @@ def handle_api_error(
         classified.retryable, classified.should_compress,
         classified.should_rotate_credential, classified.should_fallback,
     )
+    if retry_count + 1 < max_retries:
+        # Retire only a confirmed Codex Cloudflare block while an attempt is
+        # left; keep the existing retry budget and fallback-on-exhaustion path.
+        from agent.agent_runtime_helpers import refresh_codex_cloudflare_transport
+        refresh_codex_cloudflare_transport(agent, classified)
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,

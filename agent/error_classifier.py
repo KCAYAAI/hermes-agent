@@ -1025,6 +1025,26 @@ def _status_403(c: _Ctx) -> Verdict:
     else:
         raw_body_present, raw_body_text = _unstructured_error_text(c.error)
         blocked_text = raw_body_text if raw_body_present else c.msg
+    is_html = "<html" in blocked_text or "<!doctype html" in blocked_text
+    cloudflare_html = is_html and (
+        "cloudflare" in blocked_text
+        or "enable javascript and cookies to continue" in blocked_text
+        or "/cdn-cgi/challenge-platform/" in blocked_text
+        or (
+            "unable to load site" in blocked_text
+            and "if you are using a vpn" in blocked_text
+            and "ray id:" in blocked_text
+        )
+    )
+    if c.provider_slug == "openai-codex" and not c.body and (
+        cf_mitigated == "challenge" or cloudflare_html
+    ):
+        # Keep the upstream-blocked diagnosis, but give the Codex transport a
+        # bounded retry before fallback. This is not evidence of bad OAuth.
+        return _v(
+            _R.upstream_blocked, retryable=True,
+            error_context={"codex_cloudflare_block": True},
+        )
     if cf_mitigated == "challenge" or any(p in blocked_text for p in _UPSTREAM_BLOCKED_PATTERNS):
         return _V_UPSTREAM_BLOCKED
     return _V_AUTH_FALLBACK
