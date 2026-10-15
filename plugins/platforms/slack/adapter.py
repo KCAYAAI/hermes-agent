@@ -2141,7 +2141,18 @@ class SlackAdapter(BasePlatformAdapter):
             value = _first_truthy(md, sources)
             if value:
                 start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
+        try:
+            result = await client.api_call("chat.startStream", json=start_payload)
+        except Exception as exc:
+            if not (_slack_error_is(exc, "user_not_found") and start_payload.get("recipient_user_id")):
+                raise
+            # Slack Connect / external guest: the sender's user ID belongs to another org and
+            # startStream rejects it. The recipient user is optional, so retry once without it
+            # instead of degrading to a permanent plain-text progress message.
+            logger.info("[Slack] startStream rejected recipient_user_id (external user); "
+                        "retrying task card without it: channel=%s", stream.channel)
+            start_payload.pop("recipient_user_id", None)
+            result = await client.api_call("chat.startStream", json=start_payload)
         if hasattr(result, "get"):
             stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
         if not stream.stream_ts:
@@ -2559,7 +2570,16 @@ class SlackAdapter(BasePlatformAdapter):
             start_kwargs["recipient_team_id"] = str(team_id)
         if text[base:].strip():
             start_kwargs["markdown_text"] = text[base:]
-        response = await client.chat_startStream(**start_kwargs)
+        try:
+            response = await client.chat_startStream(**start_kwargs)
+        except Exception as exc:
+            if not (_slack_error_is(exc, "user_not_found") and start_kwargs.get("recipient_user_id")):
+                raise
+            # External (Slack Connect) sender: retry once without the foreign recipient user.
+            logger.info("[Slack] startStream rejected recipient_user_id (external user); "
+                        "retrying stream without it: channel=%s", chat_id)
+            start_kwargs.pop("recipient_user_id", None)
+            response = await client.chat_startStream(**start_kwargs)
         ts = response.get("ts") if response else None
         if not ts:
             raise RuntimeError("chat.startStream returned no ts")
@@ -3600,21 +3620,42 @@ class SlackAdapter(BasePlatformAdapter):
             self._processed_message_ts = dict(newest[-self._PROCESSED_MESSAGE_TS_MAX :])
 
     @staticmethod
-    def _event_team_id(event: dict, body: Optional[dict] = None) -> str:
-        """Resolve a workspace ID from the event plus Bolt's outer payload.
-        Bolt passes only the inner ``event``; Slack puts ``team_id`` on the outer payload."""
-        for payload in (event, body or {}):
-            if not isinstance(payload, dict):
-                continue
-            team = payload.get("team_id") or payload.get("team")
-            if isinstance(team, str) and team:
-                return team
-            if isinstance(team, dict) and team.get("id"):
-                return str(team["id"])
+    def _team_value(payload: Any) -> str:
+        """``team_id``/``team`` from one payload dict (string or ``{"id": ...}``), else ``""``."""
+        if not isinstance(payload, dict):
+            return ""
+        team = payload.get("team_id") or payload.get("team")
+        if isinstance(team, str) and team:
+            return team
+        if isinstance(team, dict) and team.get("id"):
+            return str(team["id"])
+        return ""
+
+    def _event_team_id(self, event: dict, body: Optional[dict] = None) -> str:
+        """Resolve the RECEIVING workspace (our installation) for an inbound event.
+
+        Bolt passes only the inner ``event``; Slack puts ``team_id`` and ``authorizations`` on the
+        outer payload. In Slack Connect (externally shared) channels the inner event's ``team`` and
+        the envelope ``team_id`` can name the SENDER's organization, and the ``message`` and
+        ``app_mention`` deliveries of one human message can disagree. Using the sender's org breaks
+        workspace-scoped dedup (both deliveries run as separate turns), splits the session key, and
+        selects the wrong token. Prefer, in order: an ``authorizations`` entry for a workspace we
+        are installed in, any other candidate we are installed in, then the legacy order
+        (inner event, envelope, authorizations) when no installed workspace matches."""
         authorizations = (body or {}).get("authorizations") if isinstance(body, dict) else None
-        for authorization in authorizations or []:
-            if isinstance(authorization, dict) and authorization.get("team_id"):
-                return str(authorization["team_id"])
+        auth_teams = [
+            str(a["team_id"]) for a in (authorizations or [])
+            if isinstance(a, dict) and a.get("team_id")]
+        legacy = [self._team_value(event), self._team_value(body or {}), *auth_teams]
+        candidates = [*auth_teams, *legacy[:2]]
+        installed = getattr(self, "_team_clients", None) or {}
+        if installed:
+            for team in candidates:
+                if team and team in installed:
+                    return team
+        for team in legacy:
+            if team:
+                return team
         return ""
 
     @staticmethod
