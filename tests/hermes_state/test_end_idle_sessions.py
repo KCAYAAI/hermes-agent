@@ -330,8 +330,10 @@ class TestStarvation:
         assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S, limit=2) == ["e1", "e2"]
 
     def test_scan_bound_caps_work_per_call(self, db):
-        """At most ``limit * 4`` candidates are inspected per call so a store full of guarded rows
-        cannot hold the write lock indefinitely; the eligible row past that bound waits for a later call."""
+        """At most ``limit * 4`` candidates are inspected and guard-checked per call.  There is no
+        cross-call cursor (accepted, documented): while ``limit * 4`` rows at the head of the order
+        stay LIVE-guarded, repeated identical calls revisit that same prefix and return nothing; the
+        eligible row behind them is ended only once those guards clear."""
         now = time.time()
         for i in range(4):  # exactly limit*4 guarded rows ahead of the eligible one
             sid = f"busy-{i}"
@@ -339,9 +341,154 @@ class TestStarvation:
             assert db.try_acquire_session_turn_lease(sid, f"turn-{i}", ttl_seconds=300)
         _make_session(db, "eligible", source="slack", started_at=now - 20 * 3600, message_at=now - 20 * 3600)
 
+        # (a) Identical repeated calls: the guarded prefix exhausts the scan budget both times.
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S, limit=1) == []
         assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S, limit=1) == []
         assert db.get_session("eligible")["ended_at"] is None
-        # Excluded ids are filtered in SQL, so they never consume scan budget.
+        for i in range(4):
+            assert db.get_session(f"busy-{i}")["ended_at"] is None
+
+        # (b) Once the guards are released the SAME call reaches the eligible row — and, with the
+        # prefix no longer guarded, ends the oldest first (``limit=1``), leaving the rest for later calls.
+        for i in range(4):
+            db.release_session_turn_lease(f"busy-{i}", f"turn-{i}")
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S, limit=1) == ["busy-0"]
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S, limit=10) == [
+            "busy-1", "busy-2", "busy-3", "eligible"]
+        assert db.get_session("eligible")["end_reason"] == "idle"
+
+
+def _publish_compression_pair(db: SessionDB, parent_id: str, child_id: str, *, stale: float) -> str:
+    """A REAL compression lineage on the slack surface: a keyed, idle parent closed by
+    ``publish_compression_child`` (``end_reason='compression'``) and its live child, which carries
+    the parent's old handoff message but a fresh ``started_at`` (stamped at publish).  Returns the
+    peer key shared by both rows."""
+    key = _make_keyed(db, parent_id, started_at=stale, message_at=stale)
+    assert db.try_acquire_compression_lock(parent_id, "compressor", ttl_seconds=60)
+    db.publish_compression_child(
+        parent_session_id=parent_id, child_session_id=child_id, source="slack",
+        messages=[{"role": "user", "content": "hello"}],  # identical to the parent's original: timestamp carried
+        compression_lock_holder="compressor")
+    db.release_compression_lock(parent_id, "compressor")
+    parent, child = db.get_session(parent_id), db.get_session(child_id)
+    assert parent["end_reason"] == "compression" and parent["ended_at"] is not None
+    assert child["parent_session_id"] == parent_id and child["ended_at"] is None
+    assert child["session_key"] == key
+    return key
+
+
+def _age_child(db: SessionDB, child_id: str, ts: float) -> None:
+    """Make a published compression child look idle: old ``started_at`` AND old canonical activity."""
+    _set_message_timestamps(db, child_id, ts)
+    _backdate_session(db, child_id, ts)
+    _set_last_activity(db, child_id, ts)
+
+
+class TestCompressionLineage:
+    """Real compression lineages built with ``publish_compression_child``: the idle TIP ends, the
+    closed parent is never touched, a freshly published child is spared, and lineage-wide pins and
+    the lineage-keyed turn lease both spare the child."""
+
+    def test_idle_child_ends_and_closed_parent_is_untouched(self, db):
+        stale = time.time() - 8 * 3600
+        key = _publish_compression_pair(db, "parent", "child", stale=stale)
+        _age_child(db, "child", stale)
+        parent_before = db.get_session("parent")
+
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == ["child"]
+
+        child = db.get_session("child")
+        assert child["ended_at"] is not None and child["end_reason"] == "idle"
+        parent_after = db.get_session("parent")
+        assert parent_after["end_reason"] == "compression"
+        assert parent_after["ended_at"] == parent_before["ended_at"]
+        assert _generation(db, key) == 1  # one boundary, one bump, for the shared peer
+
+    def test_fresh_child_with_old_copied_messages_is_spared(self, db):
+        """Just published: ``started_at`` is now even though the carried handoff message is old."""
+        stale = time.time() - 8 * 3600
+        _publish_compression_pair(db, "parent", "child", stale=stale)
+        child = db.get_session("child")
+        assert child["started_at"] > stale + 3600
+        # The handoff message kept the parent's old timestamp (``_carry_parent_timestamps``).
+        assert all(float(m["timestamp"]) <= stale + 1 for m in db.get_messages("child"))
+
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == []
+        assert db.get_session("child")["ended_at"] is None
+        assert db.get_session("parent")["end_reason"] == "compression"
+
+    def test_pin_on_parent_only_spares_idle_child_via_pinned_tail(self, db):
+        """``_not_pinned_sql`` covers the unpinned continuations of a pinned segment: pin ONLY the
+        closed parent (raw column, bypassing the lineage-wide verb) and the idle child is still spared."""
+        stale = time.time() - 8 * 3600
+        _publish_compression_pair(db, "parent", "child", stale=stale)
+        _age_child(db, "child", stale)
+        db._conn.execute("UPDATE sessions SET pinned = 1 WHERE id = ?", ("parent",))
+        db._conn.commit()
+        assert db.get_session("child")["pinned"] in (0, None)
+
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == []
+        assert db.get_session("child")["ended_at"] is None
+        # Opting out of the pin guard ends the child like any other idle row.
         assert db.end_idle_sessions(
-            sources=("slack",), max_idle_seconds=IDLE_S, limit=1,
-            exclude_ids=tuple(f"busy-{i}" for i in range(4))) == ["eligible"]
+            sources=("slack",), max_idle_seconds=IDLE_S, exclude_pinned=False) == ["child"]
+
+    def test_pin_set_through_lineage_verb_spares_idle_child(self, db):
+        """``set_session_pinned`` on the root stamps the whole lineage, so the child is pinned directly."""
+        stale = time.time() - 8 * 3600
+        _publish_compression_pair(db, "parent", "child", stale=stale)
+        _age_child(db, "child", stale)
+        assert db.set_session_pinned("parent", True)
+        assert db.get_session("child")["pinned"] == 1
+
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == []
+        assert db.get_session("child")["ended_at"] is None
+
+    def test_turn_lease_on_lineage_root_spares_idle_child(self, db):
+        """The turn lease is keyed by the lineage ROOT (``_session_turn_lease_key_on_conn`` walks
+        compression parents), so a live lease taken on the root guards the idle child."""
+        stale = time.time() - 8 * 3600
+        key = _publish_compression_pair(db, "parent", "child", stale=stale)
+        _age_child(db, "child", stale)
+        assert db._session_turn_lease_key("child") == "parent"
+        assert db.try_acquire_session_turn_lease("parent", "live-turn", ttl_seconds=300)
+
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == []
+        assert db.get_session("child")["ended_at"] is None
+        assert _generation(db, key) == 0
+
+        db.release_session_turn_lease("parent", "live-turn")
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == ["child"]
+
+
+class TestTransactionRollback:
+    """The call is one ``BEGIN IMMEDIATE`` transaction: a failure on a later victim rolls back every
+    earlier end stamp and generation bump in the same call."""
+
+    def test_failure_on_second_victim_rolls_back_first(self, db, monkeypatch):
+        stale = time.time() - 8 * 3600
+        key_a = _make_keyed(db, "a", started_at=stale - 60, message_at=stale - 60)
+        key_b = _make_keyed(db, "b", started_at=stale, message_at=stale)
+        real = db._end_and_bump
+        calls: list[str] = []
+
+        def _flaky(conn, sql, params, session_id, reason):
+            calls.append(session_id)
+            if len(calls) == 2:
+                raise RuntimeError("boom on second victim")
+            return real(conn, sql, params, session_id, reason)
+
+        monkeypatch.setattr(db, "_end_and_bump", _flaky)
+        with pytest.raises(RuntimeError, match="boom on second victim"):
+            db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S)
+        assert calls == ["a", "b"]
+
+        for sid in ("a", "b"):
+            assert db.get_session(sid)["ended_at"] is None, sid
+        assert _generation(db, key_a) == 0
+        assert _generation(db, key_b) == 0
+
+        # Without the fault the same call ends both, proving the rollback (not the data) kept them open.
+        monkeypatch.setattr(db, "_end_and_bump", real)
+        assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == ["a", "b"]
+        assert _generation(db, key_a) == 1 and _generation(db, key_b) == 1

@@ -231,10 +231,14 @@ class SessionMaintenanceMixin:
 
         ``limit`` = max rows ENDED per call, oldest first (by canonical last activity).  ``exclude_ids``
         are filtered in SQL and guard-rejected rows are paged past, so held or busy rows at the head of
-        the order cannot starve eligible rows behind them.  The extra scanning is bounded: at most
-        ``limit * 4`` candidates are inspected per call (expired guards are still reclaimed as they are
-        inspected), so a store full of guarded rows cannot hold the write lock indefinitely — the
-        remainder waits for the next call.  One ``BEGIN IMMEDIATE`` transaction: SELECT pages,
+        the order cannot starve eligible rows behind them within one call.  That extra scanning is
+        bounded: at most ``limit * 4`` candidates are inspected and guard-checked per call (expired
+        guards are still reclaimed as they are inspected).  The bound caps the Python-side guard work,
+        not the rows SQLite examines, and there is no cross-call cursor: if more than ``limit * 4``
+        rows at the head of the order stay guarded (live turn leases / compression locks), repeated
+        identical calls revisit that same guarded prefix and the eligible rows behind it wait until
+        those guards clear.  Callers should therefore pass a ``limit`` well above the number of rows
+        they expect to be concurrently guarded.  One ``BEGIN IMMEDIATE`` transaction: SELECT pages,
         guard checks and UPDATEs.
         """
         if end_reason not in _RESET_END_REASONS:
