@@ -1183,7 +1183,11 @@ history that `auto_prune` deletes after `retention_days`. Sessions with a live
 turn, pinned sessions and sessions under compression are never ended. The
 sweep runs at most once per `sessions.messaging_idle_interval_minutes`
 (default `60`) per profile; the last-run timestamp lives in that profile's
-`state.db`.
+`state.db`. Route cleanup is reconciled from database state on every run, not
+only for the rows that run ended: a routing entry whose session (or whose
+compression tip) ended with a non-recoverable reason is dropped and its cached
+agent evicted, so cleanup lost to a crash or a failed save is repaired by the
+next run. Each run examines at most 2,000 of the profile's routing entries.
 
 ```yaml
 sessions:

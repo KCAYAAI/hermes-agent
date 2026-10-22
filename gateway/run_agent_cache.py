@@ -820,7 +820,8 @@ class GatewayAgentCacheMixin:
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
     def _evict_cached_agent(self, session_key: str, *, commit_memory: bool = False,
-                            release_after_turn: bool = False) -> None:
+                            release_after_turn: bool = False,
+                            retired_session_ids: Optional[frozenset] = None) -> bool:
         """Remove a cached agent (/new, /model, ...) and soft-release its LLM client pool (AIAgent
         holds reference cycles; without it RSS grows across /new). Soft = frees clients and child
         subagents but PRESERVES terminal sandbox / browser / bg processes since the session may
@@ -835,44 +836,61 @@ class GatewayAgentCacheMixin:
 
         ``release_after_turn``: an agent still mid-turn is released when that turn's running slot
         clears (``_release_running_agent_state``) instead of being left to the garbage collector.
+
+        ``retired_session_ids``: identity-safe eviction for background cleanup (the idle sweep).
+        The entry is popped only if the cached snapshot's session id (``cache[key][3]``) is one of
+        these ids, compared under ``_agent_cache_lock``: a key is reusable, so a fresh conversation
+        may already have installed its own agent under it between the caller's route drop and
+        this call; that agent is left in place. Returns True when an entry was popped.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
+        # Tests build runners with ``_agent_cache_lock = None``; evict lock-free then. With the lock
+        # present ``_agent_cache`` is read directly (an initialized runner always has it).
+        _lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        evicted = None
+        with (_lock or nullcontext()):
+            if _cache is not None:
+                if retired_session_ids is None or self._cache_entry_in(_cache.get(session_key), retired_session_ids):
+                    evicted = _cache.pop(session_key, None)
+        if evicted is None and retired_session_ids is not None:
+            return False  # nothing of ours cached under the key (or a replacement already is)
         # Prompt-stability state rides the agent-cache lifecycle: a fresh agent must re-render its
         # session-context bytes (the pin) and re-see the current voice-channel state once.
         state = self._peek_session_state(session_key)
         if state is not None:
             state.conversation.ephemeral_pin = None
             state.conversation.vc_last = None
-        # Tests build runners with ``_agent_cache_lock = None``; evict lock-free then. With the lock
-        # present ``_agent_cache`` is read directly (an initialized runner always has it).
-        _lock = getattr(self, "_agent_cache_lock", None)
-        evicted = None
-        if _lock:
-            with _lock:
-                evicted = self._agent_cache.pop(session_key, None)
-        else:
-            _cache = getattr(self, "_agent_cache", None)
-            if _cache is not None:
-                evicted = _cache.pop(session_key, None)
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
-            return
+            return evicted is not None
         if id(agent) in self._running_agent_ids():
             if release_after_turn and state is not None:
                 state.turn.retired_agents.append(agent)
-            return
+            return True
         if commit_memory:
             target, args = self._commit_then_release_soft, (agent, session_key, True)
         else:
             target, args = self._release_evicted_agent_soft, (agent,)
         self._spawn_release_thread(target, args, f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
                                    session_key=session_key)
+        return True
 
-    def _evict_cached_agent_at_boundary(self, session_key: str) -> None:
+    @staticmethod
+    def _cache_entry_in(cached: Any, session_ids: frozenset) -> bool:
+        """True when a ``(agent, sig, msg_count, session_id)`` cache tuple records one of
+        *session_ids*. Other shapes (sentinel, bare agent, legacy 3-tuple) carry no identity and
+        are never matched: an identity-gated evict must not guess."""
+        return isinstance(cached, tuple) and len(cached) > 3 and cached[3] in session_ids
+
+    def _evict_cached_agent_at_boundary(self, session_key: str, *,
+                                        retired_session_ids: Optional[frozenset] = None) -> bool:
         """Reset and compress end the conversation the provider was tracking, so the old agent's
-        transcript is committed (``on_session_end``) before its clients go; a plain evict is not."""
-        self._evict_cached_agent(session_key, commit_memory=True)
+        transcript is committed (``on_session_end``) before its clients go; a plain evict is not.
+        ``retired_session_ids`` gates the pop on the cached agent's identity (see
+        ``_evict_cached_agent``)."""
+        return self._evict_cached_agent(session_key, commit_memory=True, retired_session_ids=retired_session_ids)
 
     def _spawn_release_thread(self, target, args: tuple, name: str, *, inline_fallback: bool,
                               session_key: Optional[str] = None) -> None:

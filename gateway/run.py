@@ -4443,9 +4443,10 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
 def _housekeeping_messaging_idle_sweep(runner, profile_label: str = "") -> None:
     """End idle messaging sessions (``sessions.messaging_idle_hours``) for ONE profile and drop
     their routes + cached agents so a late reply starts fresh; body in ``gateway.session_idle_sweep``.
-    Profile-scoped by its caller; the interval gate lives in the profile's state_meta."""
-    from gateway.session_idle_sweep import sweep_idle_messaging_sessions
-    sweep_idle_messaging_sessions(runner, profile=profile_label)
+    Profile-scoped by its caller; the interval gate lives in the profile's state_meta. Failures are
+    rate-limited WARNINGs inside (``_housekeeping_chore`` would only debug-log them)."""
+    from gateway.session_idle_sweep import run_idle_sweep_guarded
+    run_idle_sweep_guarded(runner, profile=profile_label)
 
 
 def _housekeeping_deferred_fts_retry() -> None:
