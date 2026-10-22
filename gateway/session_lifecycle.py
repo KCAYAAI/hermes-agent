@@ -58,11 +58,16 @@ def auto_continue_freshness_window() -> float:
 class SessionLifecycleMixin:
     """SessionStore explicit boundaries and crash-recovery markers."""
 
-    def _is_session_ended_in_db(self, session_id: str, session_key: Optional[str] = None) -> bool:
+    def _is_session_ended_in_db(self, session_id: str, session_key: Optional[str] = None, *,
+                                missing_is_ended: bool = True) -> bool:
         """True iff state.db says the session is gone: ended (non-null end_reason) or hard-deleted
         (no row in a readable owning DB). No DB or a DB error -> False (same failure mode as
         ``_prune_stale_sessions_locked``). Lets routing self-heal a session finalized or deleted
         while the gateway stays alive. Store resolved from the owning profile.
+
+        ``missing_is_ended=False`` asks only about an EXISTING ended row: for a compression tip
+        the id was just read from this same store, so a missing row is not a hard delete but an
+        unreadable/foreign lookup, and the direct check on the next message owns that case.
 
         Used by ``get_or_create_session`` to self-heal at routing time: ``_prune_stale_sessions_locked``
         only runs at startup, so a session ended in the DB while the gateway stays alive (any path that
@@ -87,7 +92,9 @@ class SessionLifecycleMixin:
             row = db.get_session(session_id)
         except Exception:
             return False
-        return row is None or row.get("end_reason") is not None
+        if row is None:
+            return missing_is_ended
+        return row.get("end_reason") is not None
 
     def _local_receipt_target(self, entry: Optional[SessionEntry]) -> Optional[str]:
         """The physical target the authority's receipt names for *entry*'s local route, else None

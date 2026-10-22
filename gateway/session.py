@@ -741,6 +741,10 @@ class _RouteChecks:
     canonical_id: Optional[str]  # compression tip (may equal session_id)
     is_stale: bool  # row already ended in state.db
     reset_reason: Optional[str]
+    # The TIP's row is ended too (only meaningful when canonical_id != session_id): a route parked
+    # on a compression parent heals to the tip in the apply phase, and the stale decision must then
+    # be taken for the tip, or the message routes into an ended conversation (idle sweep, reset).
+    canonical_is_stale: bool = False
 
 
 @dataclass
@@ -949,12 +953,20 @@ class SessionStore(
         checks = None
         if not force_new and observed is not None:
             sid = observed.session_id
+            canonical = self._compression_tip_for_session_id(sid)
             # A local route the authority holds by receipt is never stale: a stamped row is
             # reopened by its next admitted turn, never replaced (#140642).
+            exempt = self._local_receipt_target(observed) is not None
             checks = _RouteChecks(
-                sid, self._compression_tip_for_session_id(sid),
-                self._is_session_ended_in_db(sid) and self._local_receipt_target(observed) is None,
+                sid, canonical,
+                not exempt and self._is_session_ended_in_db(sid),
                 self._route_reset_reason(observed),
+                # The tip has no owner in the index yet (the entry still names the parent), so
+                # resolve its store from the key, not the id (#118862). Only an EXISTING ended tip
+                # row counts: the tip id was read from this store, a missing row is not a delete.
+                canonical_is_stale=(
+                    not exempt and bool(canonical) and canonical != sid
+                    and self._is_session_ended_in_db(canonical, session_key, missing_is_ended=False)),
             )
         # Phase 2 (lock): apply the decisions to _entries.
         decision = self._apply_route_checks(session_key, checks, force_new, touch_activity, now)
@@ -1000,9 +1012,12 @@ class SessionStore(
             healed = self._heal_compression_tip_locked(
                 entry, snapshot_sid, checks.canonical_id if checks else None
             )
-            checked = entry.session_id == snapshot_sid
-            stale_hit = checked and checks.is_stale
-            reset_reason = checks.reset_reason if checked else None
+            checked = checks is not None and entry.session_id == snapshot_sid
+            # Healed to the canonical tip: the snapshot's verdict about the TIP applies now.
+            healed_checked = healed and checks is not None and entry.session_id == checks.canonical_id
+            stale_hit = bool(checks is not None and (
+                (checked and checks.is_stale) or (healed_checked and checks.canonical_is_stale)))
+            reset_reason = checks.reset_reason if checked and checks is not None else None
             if stale_hit:
                 # Stale routing self-heal: drop the entry and fall through to recovery (reopens
                 # agent_close / ws_orphan_reap rows, fresh session for other end_reasons).

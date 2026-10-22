@@ -180,6 +180,62 @@ class TestRecoveredSessionActivity:
         assert result.reset_had_activity is False
 
 
+class TestHealedCompressionTipIsRevalidated:
+    """A route parked on a compression PARENT heals to the chain's tip inside the locked apply
+    phase. The stale decision must then be taken for the TIP: before this fix ``checked`` was
+    False after a heal, so an ended tip (idle sweep, reset) was routed into as if live."""
+
+    @staticmethod
+    def _store_with_chain(tmp_path, tip_row: dict):
+        db = _db_returning({
+            "parent": {"end_reason": "compression", "id": "parent"},
+            "tip": {"id": "tip", **tip_row},
+        })
+        db.get_compression_tip.side_effect = lambda sid: "tip" if sid == "parent" else sid
+        store = _make_store_with_db(tmp_path, db)
+        key = store._generate_session_key(_source())
+        store._entries[key] = _make_entry(key, "parent")
+        return store, db, key
+
+    def test_parent_route_with_live_tip_heals_and_routes_to_tip(self, tmp_path):
+        store, db, key = self._store_with_chain(tmp_path, {"end_reason": None})
+
+        result = store.get_or_create_session(_source())
+
+        assert result.session_id == "tip"
+        assert store._entries[key].session_id == "tip"
+        db.create_session.assert_not_called()
+        db.reopen_session.assert_not_called()
+
+    def test_parent_route_with_idle_ended_tip_gets_a_fresh_session(self, tmp_path):
+        """``idle`` is a reset boundary (non-recoverable): the healed route is stale, the entry
+        is dropped and a FRESH session is created; the tip stays ended."""
+        store, db, key = self._store_with_chain(tmp_path, {"end_reason": "idle"})
+
+        result = store.get_or_create_session(_source())
+
+        assert result.session_id not in ("parent", "tip")
+        assert store._entries[key].session_id == result.session_id
+        db.create_session.assert_called_once()
+        db.reopen_session.assert_not_called()
+        db.promote_to_session_reset.assert_not_called()
+
+    def test_parent_route_with_agent_close_tip_recovers_the_tip(self, tmp_path):
+        """A recoverable end on the tip takes the existing recover path: the SAME tip id is
+        reopened, exactly as a direct ``agent_close`` route would be."""
+        store, db, key = self._store_with_chain(tmp_path, {"end_reason": "agent_close"})
+        db.find_latest_gateway_session_for_peer.return_value = {
+            "id": "tip", "started_at": (datetime.now() - timedelta(hours=2)).timestamp(),
+        }
+
+        result = store.get_or_create_session(_source())
+
+        assert result.session_id == "tip"
+        assert store._entries[key].session_id == "tip"
+        db.reopen_session.assert_called_once_with("tip")
+        db.create_session.assert_not_called()
+
+
 class TestAdvanceCompressionSession:
     def test_cas_advances_route_without_reopening_rows(self, tmp_path):
         db = _db_returning({})
