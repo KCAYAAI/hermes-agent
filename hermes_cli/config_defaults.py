@@ -2291,6 +2291,15 @@ DEFAULT_CONFIG = {
         "auto_archive": False,
         # Idle days before auto-archive hides a session (only when auto_archive is true).
         "auto_archive_days": 3,
+        # Gateway idle sweep for messaging sessions (hours, 0 = off): ends open sessions of
+        # messaging_idle_sources idle this long with end_reason `idle`, drops their routes and evicts
+        # their cached agents, so a late reply starts a FRESH conversation (Slack reseeds the thread
+        # history) and auto_prune can later delete the ended rows. Busy sessions (live turn) are spared.
+        "messaging_idle_hours": 0,
+        # Sources the idle sweep covers (lifecycle the gateway owns).
+        "messaging_idle_sources": ["slack"],
+        # Minimum minutes between idle-sweep runs per profile (tracked in state.db state_meta).
+        "messaging_idle_interval_minutes": 60,
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,

@@ -4440,6 +4440,14 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
+def _housekeeping_messaging_idle_sweep(runner, profile_label: str = "") -> None:
+    """End idle messaging sessions (``sessions.messaging_idle_hours``) for ONE profile and drop
+    their routes + cached agents so a late reply starts fresh; body in ``gateway.session_idle_sweep``.
+    Profile-scoped by its caller; the interval gate lives in the profile's state_meta."""
+    from gateway.session_idle_sweep import sweep_idle_messaging_sessions
+    sweep_idle_messaging_sessions(runner, profile=profile_label)
+
+
 def _housekeeping_deferred_fts_retry() -> None:
     """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
     and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
@@ -4503,7 +4511,7 @@ def _start_gateway_housekeeping(
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
-    from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.run_profile_reconcile import _for_each_served_profile, _mcp_config_reconciler, profile_scoped_chore
     from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
@@ -4531,6 +4539,10 @@ def _start_gateway_housekeeping(
         # Per served profile: each profile has its own skills tree, curator state, Nous login
         # and state.db.
         (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
+        # Every tick; the sweep's own interval gate (state_meta) owns the cadence. Before the
+        # maintenance tick so an idle-ended row is visible to the same tick's auto-prune accounting.
+        (1, "Messaging idle sweep", lambda: _for_each_served_profile(
+            runner, lambda label: _housekeeping_messaging_idle_sweep(runner, label))),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.

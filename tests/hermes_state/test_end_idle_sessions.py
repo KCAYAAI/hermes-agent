@@ -163,6 +163,12 @@ class TestEndIdleSessions:
         assert db.get_session("victim")["ended_at"] is None
 
 
+def _last_active_sql() -> str:
+    """The canonical last-activity expression ``end_idle_sessions`` evaluates, on ``sessions``."""
+    from hermes_state_common import _sql_session_last_active
+    return _sql_session_last_active("sessions")
+
+
 def _generation(db: SessionDB, session_key: str, source: str = "slack") -> int:
     return db.latest_conversation_boundary(session_key, source) or 0
 
@@ -410,8 +416,17 @@ class TestCompressionLineage:
         _publish_compression_pair(db, "parent", "child", stale=stale)
         child = db.get_session("child")
         assert child["started_at"] > stale + 3600
-        # The handoff message kept the parent's old timestamp (``_carry_parent_timestamps``).
-        assert all(float(m["timestamp"]) <= stale + 1 for m in db.get_messages("child"))
+        # The handoff message kept the parent's old timestamp (``_carry_parent_timestamps``): the
+        # handoff is nonempty and its messages are old, so only ``started_at`` keeps the child fresh.
+        handoff = db.get_messages("child")
+        assert handoff, "published child carries no handoff message"
+        assert all(float(m["timestamp"]) <= stale + 1 for m in handoff)
+        # And the canonical activity (freshest of last_activity_at / messages / started_at) is
+        # pinned to the old handoff, not to now: the spare below is the started_at predicate alone.
+        _set_last_activity(db, "child", stale)
+        row = db._conn.execute(
+            f"SELECT {_last_active_sql()} AS la FROM sessions WHERE id = ?", ("child",)).fetchone()
+        assert float(row["la"]) <= stale + 1
 
         assert db.end_idle_sessions(sources=("slack",), max_idle_seconds=IDLE_S) == []
         assert db.get_session("child")["ended_at"] is None

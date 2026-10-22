@@ -1171,6 +1171,27 @@ sessions:
 Installs that set any of these keys explicitly keep their values; only unset
 keys follow the defaults.
 
+**Idle messaging sessions (gateway).** Messaging conversations the gateway owns
+(Slack by default) otherwise stay open forever, so a reply in a thread days
+later resumes the old context. Set `sessions.messaging_idle_hours` (default
+`0`, off) and the gateway's housekeeping thread ends open sessions of
+`sessions.messaging_idle_sources` whose start *and* last activity are older
+than that many hours with `end_reason: idle`, drops their routing entries and
+evicts their cached agents. A late reply then starts a fresh session (Slack
+reseeds the thread history on that first turn), and the ended row is just
+history that `auto_prune` deletes after `retention_days`. Sessions with a live
+turn, pinned sessions and sessions under compression are never ended. The
+sweep runs at most once per `sessions.messaging_idle_interval_minutes`
+(default `60`) per profile; the last-run timestamp lives in that profile's
+`state.db`.
+
+```yaml
+sessions:
+  messaging_idle_hours: 24           # 0 (default) keeps messaging sessions open indefinitely
+  messaging_idle_sources: [slack]    # sources the idle sweep covers
+  messaging_idle_interval_minutes: 60
+```
+
 Only **ended** sessions are ever deleted. Active sessions are never auto-pruned,
 regardless of age. Ended sessions are aged from their last activity — the
 freshest of live activity, latest message, or session start — so a long-lived
