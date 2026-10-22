@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
-    AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
-    escape_like as _escape_like, emit_session_deleted,
+    AUTO_VACUUM_MIN_FREELIST_RATIO, _RESET_END_REASONS, _id_chunks, _non_continuation_child_sql, _placeholders,
+    _sql_session_last_active, escape_like as _escape_like, emit_session_deleted,
 )
 from hermes_startup_watchdog import report_startup_progress
 
@@ -214,6 +214,52 @@ class SessionMaintenanceMixin:
                 f" WHERE id IN ({_placeholders(victims)}) AND ended_at IS NULL{scope_sql}",
                 (time.time(), *victims, *scope_params))
             return victims
+        return self._execute_write(_do) or []
+
+    def end_idle_sessions(
+        self, *, sources: tuple[str, ...], max_idle_seconds: float, end_reason: str = "idle",
+        exclude_ids: tuple[str, ...] = (), exclude_pinned: bool = True, limit: int = 500,
+    ) -> list[str]:
+        """End open rows of messaging ``sources`` whose lifecycle the gateway owns (slack, telegram, ...)
+        once BOTH ``started_at`` and canonical last activity are older than ``max_idle_seconds``; the
+        caller must drop its in-memory routes for the returned ids or the next message resumes a row
+        the DB already closed.  ``end_reason`` must be a ``_RESET_END_REASONS`` member: this is a
+        deliberate conversation boundary, so the peer's generation advances and recovery is fenced —
+        a recoverable reason (``startup_orphan_reap``) would let the next message reopen the row with
+        its full history.  Pinned rows are spared unless ``exclude_pinned=False``; live turn leases and
+        compression locks always spare the row.  No gateway-heartbeat gate: the owner is the caller.
+        """
+        if end_reason not in _RESET_END_REASONS:
+            raise ValueError(
+                f"end_idle_sessions end_reason must be a reset boundary {_RESET_END_REASONS}, got {end_reason!r}")
+        srcs = tuple(s for s in sources if s)
+        if max_idle_seconds <= 0 or limit <= 0 or not srcs:
+            return []
+        cutoff = time.time() - max_idle_seconds
+        last_active = _sql_session_last_active("sessions")
+        pin_scope = f" AND {_not_pinned_sql('sessions')}" if exclude_pinned else ""
+        scope_sql = (f" AND source IN ({_placeholders(srcs)}){pin_scope}"
+                     f" AND started_at < ? AND {last_active} < ?")
+        scope_params = (*srcs, cutoff, cutoff)
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT id FROM sessions WHERE ended_at IS NULL{scope_sql}"
+                f" ORDER BY {last_active} ASC, started_at ASC LIMIT ?",
+                (*scope_params, int(limit))).fetchall()
+            excluded = {str(x) for x in exclude_ids if x}
+            victims = [sid for sid in (str(row["id"]) for row in rows)
+                       if sid not in excluded and not self._write_guards_reject(conn, sid)]
+            ended: list[str] = []
+            now = time.time()
+            for sid in victims:
+                # Re-apply every predicate under the write lock; only a row this statement actually
+                # ended advances the peer's conversation generation.
+                if self._end_and_bump(
+                        conn, f"UPDATE sessions SET ended_at = ?, end_reason = ?"
+                              f" WHERE id = ? AND ended_at IS NULL{scope_sql}",
+                        (now, end_reason, sid, *scope_params), sid, end_reason):
+                    ended.append(sid)
+            return ended
         return self._execute_write(_do) or []
 
     @staticmethod
