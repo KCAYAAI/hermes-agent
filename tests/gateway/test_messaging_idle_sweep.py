@@ -76,6 +76,17 @@ def _enable(monkeypatch, cfg: dict = _ENABLED) -> None:
     monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_sweep_state(monkeypatch):
+    """The sweep keeps per-profile module state (pending retries, window cursor, failure
+    backoff); every test starts with none of it."""
+    import gateway.session_idle_sweep as sweep_mod
+    monkeypatch.setattr(sweep_mod, "_PENDING", {})
+    monkeypatch.setattr(sweep_mod, "_CURSOR", {})
+    monkeypatch.setattr(sweep_mod, "_FAILURES", {})
+    monkeypatch.setattr(sweep_mod, "_WARNED_AT", {})
+
+
 @pytest.fixture
 def store(tmp_path):
     handle = SessionStore(tmp_path / "sessions", GatewayConfig())
@@ -334,6 +345,26 @@ def test_slack_adapter_sees_no_active_thread_session_after_the_sweep(store, monk
     assert store._db.get_session(old.session_id)["end_reason"] == "idle"
 
 
+def test_slack_adapter_reseeds_when_the_routed_row_is_ended_but_the_entry_remains(store):
+    """Between the DB commit and the route drop (or after a lost drop) the entry still names an
+    ENDED row. Routing will mint a fresh session for that message, so the thread must reseed:
+    the check consults the row, not just entry presence/suspension."""
+    from plugins.platforms.slack.adapter import SlackAdapter
+    from gateway.config import PlatformConfig
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="«redacted:xox…»"))
+    adapter._session_store = store
+    source = adapter._thread_session_source("C1", "1000.0", "U123", "", "group")
+    old = store.get_or_create_session(source)
+    # Entry present, row live -> active.
+    assert adapter._has_active_session_for_thread("C1", "1000.0", "U123") is True
+
+    store._db.end_session(old.session_id, "idle")
+    assert store._entries[old.session_key].session_id == old.session_id  # route NOT dropped
+
+    assert adapter._has_active_session_for_thread("C1", "1000.0", "U123") is False
+
+
 # ---------------------------------------------------------------------------
 # 9. Race: message lands between the DB commit and the route drop
 # ---------------------------------------------------------------------------
@@ -411,6 +442,110 @@ def test_failed_save_still_evicts_the_dropped_routes_agent_and_propagates(store,
         assert key not in _routing_rows(reloaded)
     finally:
         reloaded.close_all_db_handles()
+
+
+def test_failed_save_is_retried_by_the_next_run_without_other_traffic(store, monkeypatch):
+    """The in-memory drop happened but ``_save`` failed: the next run (no restart, nothing else
+    to drop) first retries the save, so the durable index loses the route."""
+    _enable(monkeypatch)
+    entry = store.get_or_create_session(_slack_source())
+    key, sid = entry.session_key, entry.session_id
+    _age(store._db, sid, time.time() - STALE)
+    runner = _Runner(store)
+    real_save = store._save
+    monkeypatch.setattr(store, "_save", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        _sweep(runner)
+    assert key not in store._entries and key in _routing_rows(store)
+
+    monkeypatch.setattr(store, "_save", real_save)
+    again = _sweep(runner)
+
+    assert again["ended"] == [] and again["routes_dropped"] == 0
+    assert key not in _routing_rows(store) and key not in _mirror_keys(store)
+    assert runner.evicted == [key]  # evicted once, by the first run
+
+
+def test_failed_save_that_fails_again_keeps_the_run_failing(store, monkeypatch):
+    """A pending save that still fails must not let the run stamp the interval."""
+    _enable(monkeypatch)
+    from gateway.session_idle_sweep import LAST_RUN_META_KEY
+    entry = store.get_or_create_session(_slack_source())
+    _age(store._db, entry.session_id, time.time() - STALE)
+    monkeypatch.setattr(store, "_save", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    runner = _Runner(store)
+    with pytest.raises(OSError):
+        _sweep(runner)
+    with pytest.raises(OSError):
+        _sweep(runner)
+    assert store._db.get_meta(LAST_RUN_META_KEY) in (None, "")
+    assert entry.session_key in _routing_rows(store)
+
+
+def test_failed_eviction_is_retried_by_the_next_run(store, monkeypatch):
+    """Eviction raised after the route was dropped: the key is remembered with its retired ids
+    and evicted on the next run (the state-based reconcile no longer sees the route)."""
+    _enable(monkeypatch)
+    entry = store.get_or_create_session(_slack_source())
+    key = entry.session_key
+    _age(store._db, entry.session_id, time.time() - STALE)
+    runner = _Runner(store)
+    seen: list[tuple[str, frozenset]] = []
+    fail = [True]
+
+    def _evict(session_key, *, retired_session_ids=None):
+        seen.append((session_key, frozenset(retired_session_ids or ())))
+        if fail[0]:
+            raise RuntimeError("release thread unavailable")
+        runner.evicted.append(session_key)
+        return True
+
+    runner._evict_cached_agent_at_boundary = _evict
+    first = _sweep(runner)
+    assert first["routes_dropped"] == 1 and first["agents_evicted"] == 0
+    assert key not in store._entries and runner.evicted == []
+
+    fail[0] = False
+    from gateway.session_idle_sweep import LAST_RUN_META_KEY
+    store._db.set_meta(LAST_RUN_META_KEY, str(time.time() - 61 * 60))
+    again = _sweep(runner)
+
+    assert again["routes_dropped"] == 0 and again["agents_evicted"] == 1
+    assert runner.evicted == [key]
+    assert seen[-1] == (key, frozenset({entry.session_id}))  # same retired identity, not a bare key
+    # Cleared on success: a third run does not evict again.
+    store._db.set_meta(LAST_RUN_META_KEY, str(time.time() - 61 * 60))
+    assert _sweep(runner)["agents_evicted"] == 0 and runner.evicted == [key]
+
+
+def test_failed_lineage_lookup_leaves_the_key_for_the_next_run(store, monkeypatch):
+    """A lineage read that fails would yield a partial id set; the key is left alone this run
+    (its route still routes to the ended row, so the next run finds it again) rather than
+    dropped with ancestors' cache identities missing."""
+    import gateway.session_idle_sweep as sweep_mod
+    _enable(monkeypatch)
+    entry = store.get_or_create_session(_slack_source())
+    key = entry.session_key
+    store._db.end_session(entry.session_id, "session_reset")
+    runner = _Runner(store)
+    real_lineage = SessionDB.get_compression_lineage
+    broken = [True]
+
+    def _lineage(self, sid):
+        if broken[0]:
+            raise OSError("database is locked")
+        return real_lineage(self, sid)
+
+    monkeypatch.setattr(SessionDB, "get_compression_lineage", _lineage)
+
+    result = _sweep(runner)
+    assert result["routes_dropped"] == 0
+    assert key in store._entries and runner.evicted == []
+
+    broken[0] = False
+    store._db.set_meta(sweep_mod.LAST_RUN_META_KEY, str(time.time() - 61 * 60))
+    again = _sweep(runner)
+    assert again["routes_dropped"] == 1 and key not in store._entries and runner.evicted == [key]
 
 
 def test_set_meta_runs_only_after_reconcile_succeeds(store, monkeypatch):
@@ -507,6 +642,107 @@ def test_reconcile_examines_at_most_the_documented_bound(store, monkeypatch):
 
     assert result["routes_dropped"] == 2
     assert sum(e.session_key in store._entries for e in entries) == 1
+
+
+def test_bound_window_rotates_so_a_route_behind_2000_live_entries_is_reached(store, monkeypatch):
+    """2,000 retained live entries sort ahead of one idle-ended route: a fixed prefix would starve
+    it forever; the per-profile cursor reaches it on the second run."""
+    from gateway.session import SessionEntry
+    import gateway.session_idle_sweep as sweep_mod
+    _enable(monkeypatch)
+    assert sweep_mod._RECONCILE_LIMIT == 2000
+    victim = store.get_or_create_session(_slack_source())
+    key = victim.session_key
+    store._db.end_session(victim.session_id, "idle")
+    with store._lock:
+        for i in range(2000):
+            k = f"agent:main:slack:group:C1:0000{i:05d}"  # "0" < "1": sorts ahead of the victim
+            assert k < key
+            store._entries[k] = SessionEntry(
+                session_key=k, session_id=f"live-{i}", created_at=victim.created_at,
+                updated_at=victim.updated_at, platform=Platform.SLACK, chat_type="group")
+    runner = _Runner(store)
+
+    first = _sweep(runner)
+    assert first["routes_dropped"] == 0 and key in store._entries
+    store._db.set_meta(sweep_mod.LAST_RUN_META_KEY, str(time.time() - 61 * 60))
+    second = _sweep(runner)
+
+    assert second["routes_dropped"] == 1
+    assert key not in store._entries and runner.evicted == [key]
+    assert sum(1 for k in store._entries if k.startswith("agent:main:slack:group:C1:0000")) == 2000
+
+
+# ---------------------------------------------------------------------------
+# 10b. Compare-and-drop: a fresh route installed under the same key during the DB read survives
+# ---------------------------------------------------------------------------
+
+def test_fresh_route_installed_during_the_db_read_is_kept_and_persisted(store, monkeypatch):
+    """Retirement snapshots ids, releases the lock for the DB reads, then drops. A fresh,
+    active-token-bearing route installed under the same key meanwhile is a different
+    conversation: the drop compares the routed id under the lock and leaves it, on disk too."""
+    from gateway.session import SessionEntry
+    import gateway.session_idle_sweep as sweep_mod
+    _enable(monkeypatch)
+    old = store.get_or_create_session(_slack_source())
+    key = old.session_key
+    _age(store._db, old.session_id, time.time() - STALE)
+    runner = _Runner(store)
+    real_reasons = sweep_mod._end_reasons
+    fresh = SessionEntry(
+        session_key=key, session_id="fresh-sid", created_at=old.created_at,
+        updated_at=old.updated_at, platform=Platform.SLACK, chat_type="group",
+        active_turn_token="tok-fresh")
+
+    def _read_then_replace(*args, **kwargs):
+        out = real_reasons(*args, **kwargs)
+        with store._lock:
+            store._entries[key] = fresh
+            store._save()
+        return out
+
+    monkeypatch.setattr(sweep_mod, "_end_reasons", _read_then_replace)
+
+    result = _sweep(runner)
+
+    assert result["ended"] == [old.session_id]
+    assert result["routes_dropped"] == 0 and runner.evicted == []
+    assert store._entries[key] is fresh
+    # Persisted unchanged: the durable row is the fresh route as it was written, not a removal.
+    persisted = json.loads(_routing_rows(store)[key])
+    assert persisted["session_id"] == "fresh-sid"
+    assert persisted["active_turn_token"] == "tok-fresh"
+    assert key in _mirror_keys(store)
+    reloaded = SessionStore(store.sessions_dir, GatewayConfig())
+    try:
+        reloaded._ensure_loaded()
+        assert reloaded._entries[key].session_id == "fresh-sid"
+    finally:
+        reloaded.close_all_db_handles()
+
+
+def test_route_that_became_busy_during_the_db_read_is_kept(store, monkeypatch):
+    """Same key, same id, but a turn started on it meanwhile: the busy recheck under the lock
+    keeps the route (the turn's own unwind must still find its entry)."""
+    import gateway.session_idle_sweep as sweep_mod
+    _enable(monkeypatch)
+    old = store.get_or_create_session(_slack_source())
+    key = old.session_key
+    store._db.end_session(old.session_id, "session_reset")
+    runner = _Runner(store)
+    real_reasons = sweep_mod._end_reasons
+
+    def _read_then_start_turn(*args, **kwargs):
+        out = real_reasons(*args, **kwargs)
+        runner.running.append((key, object()))
+        return out
+
+    monkeypatch.setattr(sweep_mod, "_end_reasons", _read_then_start_turn)
+
+    result = _sweep(runner)
+
+    assert result["routes_dropped"] == 0 and runner.evicted == []
+    assert store._entries[key].session_id == old.session_id
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +895,8 @@ def test_persistent_failure_warns_once_per_interval_per_profile(monkeypatch, cap
 
     with caplog.at_level(logging.DEBUG, logger="gateway.session_idle_sweep"):
         _housekeeping_messaging_idle_sweep(runner, "a")   # tick 1: WARNING
-        _housekeeping_messaging_idle_sweep(runner, "a")   # tick 2, same interval: debug
+        clock[0] += 301                                   # past the first retry backoff (300 s)
+        _housekeeping_messaging_idle_sweep(runner, "a")   # retry, same warn interval: debug
         _housekeeping_messaging_idle_sweep(runner, "b")   # other profile: its own WARNING
         clock[0] += sweep_mod._WARN_INTERVAL_S + 1
         _housekeeping_messaging_idle_sweep(runner, "a")   # next interval: WARNING again
@@ -668,6 +905,50 @@ def test_persistent_failure_warns_once_per_interval_per_profile(monkeypatch, cap
     warnings = [r for r in records if r.levelno == logging.WARNING]
     assert [r.getMessage().split("(")[1].split(")")[0] for r in warnings] == ["a", "b", "a"]
     assert len(records) == 4 and records[1].levelno == logging.DEBUG
+
+
+def test_failed_run_backs_off_exponentially_capped_at_the_interval_and_resets_on_success(monkeypatch):
+    """After n consecutive failures the next attempt waits ``min(interval, 300 s * 2**(n-1))``;
+    a success clears the count. Interval here: 60 minutes."""
+    import gateway.session_idle_sweep as sweep_mod
+    _enable(monkeypatch)
+    calls: list[float] = []
+    outcome = {"fail": True}
+
+    def _sweep_stub(runner, *, profile=""):
+        calls.append(clock[0])
+        if outcome["fail"]:
+            raise RuntimeError("sweep exploded")
+        return {"skipped": None}
+
+    monkeypatch.setattr(sweep_mod, "sweep_idle_messaging_sessions", _sweep_stub)
+    clock = [10_000.0]
+    monkeypatch.setattr(sweep_mod.time, "monotonic", lambda: clock[0])
+    runner = SimpleNamespace(session_store=None)
+    run = lambda: sweep_mod.run_idle_sweep_guarded(runner, profile="a")
+
+    run()                                   # n=1 -> wait 300
+    for dt in (60, 239):
+        clock[0] += dt; run()
+    assert len(calls) == 1
+    clock[0] += 1; run()                    # 300 s later: n=2 -> wait 600
+    assert len(calls) == 2
+    clock[0] += 599; run(); assert len(calls) == 2
+    clock[0] += 1; run()                    # n=3 -> 1200
+    clock[0] += 1200; run()                 # n=4 -> 2400
+    clock[0] += 2400; run()                 # n=5 -> min(3600, 4800) = 3600
+    assert len(calls) == 5
+    clock[0] += 3599; run(); assert len(calls) == 5
+    clock[0] += 1; run(); assert len(calls) == 6   # n=6, still capped at 3600
+    clock[0] += 3600
+    outcome["fail"] = False
+    run(); assert len(calls) == 7            # success resets the count ...
+    outcome["fail"] = True
+    clock[0] += 1; run(); assert len(calls) == 8   # ... so the very next tick runs again (n=1)
+    clock[0] += 299; run(); assert len(calls) == 8
+    clock[0] += 1; run(); assert len(calls) == 9
+    # Another profile has its own count.
+    sweep_mod.run_idle_sweep_guarded(runner, profile="b"); assert len(calls) == 10
 
 
 # ---------------------------------------------------------------------------

@@ -6247,7 +6247,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
             # Explicit suspension starts a fresh conversation on the next turn and
             # must not suppress thread-history reseeding. Elapsed time is not a boundary.
-            return not entry.suspended
+            if entry.suspended:
+                return False
+            # A route still naming a row state.db has ENDED (the idle sweep committed but has
+            # not dropped the route yet, or that drop was lost) routes to a FRESH session on
+            # this message, so the thread must reseed its history too.
+            if session_store._is_session_ended_in_db(entry.session_id, session_key) is True:
+                return False
+            return True
         except Exception:
             return False
 

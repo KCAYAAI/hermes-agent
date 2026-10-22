@@ -12,7 +12,15 @@ fresh session, and Slack reseeds the thread history.
 Reconcile is state-based, not event-based: it does not depend on what THIS run ended, so a route
 whose cleanup was lost to a crash, a failed save or a failed lineage lookup after the DB commit is
 picked up by the next run (idempotent, self-healing across restarts). It is bounded to
-``_RECONCILE_LIMIT`` entries per run, read in a few batched ``IN (...)`` queries.
+``_RECONCILE_LIMIT`` entries per run, read in a few batched ``IN (...)`` queries; successive runs
+examine successive windows of the profile's entries (``_CURSOR``), so a non-removable prefix
+cannot starve later entries.
+
+What a run cannot repair from state alone, it remembers in-process (``_PENDING``, per profile):
+a drop whose ``_save`` failed (the route is gone from memory, so no later reconcile would see it)
+and an eviction that raised (likewise). The next run retries those first and clears each only on
+success. An in-memory record is enough: after a restart the durable route reloads and the
+state-based reconcile finds it again (or the startup prune drops it).
 
 Runs on the housekeeping thread, once per served profile under that profile's runtime scope
 (``_for_each_served_profile``): ``load_config()`` and ``acquire()`` resolve to the scoped profile's
@@ -46,6 +54,14 @@ _RECONCILE_LIMIT = 2000
 # A persistently failing sweep warns at most this often per profile (debug otherwise).
 _WARN_INTERVAL_S = 3600.0
 _WARNED_AT: dict[str, float] = {}
+# Retry backoff after a failed run: the next attempt waits ``min(interval, _BACKOFF_BASE_S *
+# 2**(n-1))`` for n consecutive failures. ``_FAILURES[profile] = (n, monotonic of last failure)``.
+_BACKOFF_BASE_S = 300.0
+_FAILURES: dict[str, tuple[int, float]] = {}
+# Per-profile window cursor into the profile's entries sorted by key (see ``_window``).
+_CURSOR: dict[str, int] = {}
+# Per-profile obligations a failed run left behind: ``{"needs_save": bool, "evict": {key: ids}}``.
+_PENDING: dict[str, dict[str, Any]] = {}
 # Rows ended with these reasons are never retired here: ``compression`` means "continued by a
 # child" (the tip decides), the recoverable set is reopened by the next message (#54878 recovery).
 _KEEP_END_REASONS = frozenset(_RECOVERABLE_END_REASONS) | {"compression"}
@@ -124,29 +140,50 @@ def _retired_reason(reason: Any) -> bool:
     return reason is not None and reason not in _KEEP_END_REASONS
 
 
-def _lineage_ids(db: Any, session_id: str) -> set[str]:
+def _lineage_ids(db: Any, session_id: str) -> Optional[set[str]]:
     """``{session_id}`` plus its compression ancestors/descendants (``get_compression_lineage``
-    walks ``parent_session_id`` through parents ended by compression, skipping explicit forks)."""
+    walks ``parent_session_id`` through parents ended by compression, skipping explicit forks).
+    None when the lookup failed: a partial id set would miss the cache identities the eviction
+    compares against, so the caller leaves that key for the next run."""
     ids = {session_id}
     try:
         ids.update(str(x) for x in db.get_compression_lineage(session_id) if x)
     except Exception:
         logger.debug("Compression lineage lookup failed for %s", session_id, exc_info=True)
+        return None
     return ids
 
 
-def _find_retired_routes(db: Any, store: Any, owner: str, running: set[str]) -> dict[str, set[str]]:
-    """``{key: retired session ids}`` for the swept profile's routing entries whose row ended with
-    a non-recoverable reason, or whose row is a compression parent whose tip did. At most
-    ``_RECONCILE_LIMIT`` entries examined: one batched read for the routed ids, one per compression
-    parent for its tip (rare: routes normally heal to the tip), one batched read for those tips.
-    Busy entries are skipped: the turn's own unwind must still find its entry (#99106 guards the
-    next message)."""
+def _window(items: list[tuple[str, str]], owner: str) -> list[tuple[str, str]]:
+    """At most ``_RECONCILE_LIMIT`` of *items* (sorted by key), starting at this profile's cursor
+    and wrapping around; the cursor advances past the window so successive runs cover successive
+    windows and a non-removable prefix (live, busy, missing or unresolved rows) cannot starve the
+    rest."""
+    items = sorted(items)
+    n = len(items)
+    if n <= _RECONCILE_LIMIT:
+        _CURSOR[owner] = 0
+        return items
+    start = _CURSOR.get(owner, 0) % n
+    end = start + _RECONCILE_LIMIT
+    window = items[start:end] + items[:max(0, end - n)]
+    _CURSOR[owner] = end % n
+    return window
+
+
+def _find_retired_routes(db: Any, store: Any, owner: str, running: set[str]) -> dict[str, tuple[str, set[str]]]:
+    """``{key: (routed session id, retired session ids)}`` for the swept profile's routing
+    entries whose row ended with a non-recoverable reason, or whose row is a compression parent
+    whose tip did. The routed id is the identity the drop compares against under the lock
+    (``_drop_routes``). At most ``_RECONCILE_LIMIT`` entries examined per run (``_window``): one
+    batched read for the routed ids, one per compression parent for its tip (rare: routes
+    normally heal to the tip), one batched read for those tips. Busy entries are skipped: the
+    turn's own unwind must still find its entry (#99106 guards the next message)."""
     with store._lock:
         store._ensure_loaded_locked()
         candidates = [(key, str(entry.session_id)) for key, entry in _owned_entries(store, owner)
                       if getattr(entry, "session_id", None) and not _is_busy(key, entry, running)]
-    candidates = candidates[:_RECONCILE_LIMIT]
+    candidates = _window(candidates, owner)
     if not candidates:
         return {}
     reasons = _end_reasons(db, {sid for _key, sid in candidates})
@@ -162,27 +199,43 @@ def _find_retired_routes(db: Any, store: Any, owner: str, running: set[str]) -> 
                 tips[sid] = str(tip)
     if tips:
         reasons.update(_end_reasons(db, set(tips.values()) - set(reasons)))
-    retired: dict[str, set[str]] = {}
+    retired: dict[str, tuple[str, set[str]]] = {}
     for key, sid in candidates:
         # A compression parent without a resolvable tip keeps ``target == sid`` and its
         # ``compression`` reason is in the keep set, so it is left alone.
         target = tips.get(sid, sid)
         if _retired_reason(reasons.get(target)):
-            retired[key] = _lineage_ids(db, target) | {sid}
+            lineage = _lineage_ids(db, target)
+            if lineage is None:
+                continue  # left for the next run: the route still names the ended row
+            retired[key] = (sid, lineage | {sid})
     return retired
 
 
-def _drop_routes(store: Any, keys: list[str], session_ids: set[str]) -> tuple[list[str], Optional[Exception]]:
-    """Drop *keys* under the store lock, forget owner hints for *session_ids*, persist once
-    (``_save``, the way ``remove_by_session_id`` does). Returns ``(dropped keys, save error)``:
-    the keys are gone from memory even when the save failed, so the caller still evicts their
-    agents and then re-raises (the on-disk copy is repaired by the next successful save or the
-    startup prune, ``_prune_stale_sessions_locked``)."""
-    if store is None or not keys:
+def _drop_routes(store: Any, runner: Any, expected: dict[str, str], session_ids: set[str],
+                 ) -> tuple[list[str], Optional[Exception]]:
+    """Compare-and-drop: under the store lock, pop each key of *expected* ONLY while its entry
+    still routes to the session id the retirement read saw AND it is not busy now (fresh running
+    set). A replacement route installed meanwhile (a new conversation under the same key) or a
+    turn that started on it is left alone, in memory and on disk. Then forget owner hints for
+    *session_ids* and persist once (``_save``, the way ``remove_by_session_id`` does).
+
+    Returns ``(dropped keys, save error)``: the keys are gone from memory even when the save
+    failed, so the caller still evicts their agents, records the pending save and re-raises."""
+    if store is None or not expected:
         return [], None
+    running = _running_keys(runner)
     with store._lock:
         store._ensure_loaded_locked()
-        dropped = [key for key in keys if store._entries.pop(key, None) is not None]
+        dropped: list[str] = []
+        for key, sid in expected.items():
+            entry = store._entries.get(key)
+            if entry is None or str(getattr(entry, "session_id", None)) != sid:
+                continue
+            if _is_busy(key, entry, running):
+                continue
+            store._entries.pop(key, None)
+            dropped.append(key)
         hints = getattr(store, "_session_owner_hints", None)
         if hints is not None:
             for sid in session_ids:
@@ -206,19 +259,52 @@ def _evict_retired_agent(runner: Any, key: str, retired_ids: set[str]) -> bool:
     return bool(evict(key, retired_session_ids=frozenset(retired_ids)))
 
 
+def _pending(owner: str) -> dict[str, Any]:
+    return _PENDING.setdefault(owner, {"needs_save": False, "evict": {}})
+
+
+def _evict_or_remember(runner: Any, owner: str, key: str, retired_ids: set[str], report: dict[str, Any]) -> None:
+    """Evict; on an exception remember ``key -> ids`` so the next run retries with the same
+    retired identity (the route is already gone, so reconcile alone would never revisit it)."""
+    try:
+        if _evict_retired_agent(runner, key, retired_ids):
+            report["agents_evicted"] += 1
+    except Exception:
+        logger.debug("Idle sweep: agent eviction failed for %s (retried next run)", key, exc_info=True)
+        _pending(owner)["evict"][key] = set(retired_ids)
+
+
+def _retry_pending(runner: Any, store: Any, owner: str, report: dict[str, Any]) -> None:
+    """Drain what a failed run left behind, before this run's own work: the save of an earlier
+    in-memory drop, then evictions that raised. Each item is cleared only on success; a save that
+    fails again raises (the run fails, the interval is not stamped, backoff applies)."""
+    pending = _PENDING.get(owner)
+    if not pending:
+        return
+    if pending.get("needs_save"):
+        with store._lock:
+            store._ensure_loaded_locked()
+            store._save()
+        pending["needs_save"] = False
+    for key, ids in list(pending.get("evict", {}).items()):
+        del pending["evict"][key]
+        _evict_or_remember(runner, owner, key, ids, report)
+    if not pending["needs_save"] and not pending["evict"]:
+        _PENDING.pop(owner, None)
+
+
 def _reconcile_routes(runner: Any, db: Any, store: Any, owner: str, report: dict[str, Any]) -> None:
     retired = _find_retired_routes(db, store, owner, _running_keys(runner))
     if not retired:
         return
-    all_ids: set[str] = set().union(*retired.values())
-    dropped, save_error = _drop_routes(store, list(retired), all_ids)
+    all_ids: set[str] = set().union(*(ids for _sid, ids in retired.values()))
+    dropped, save_error = _drop_routes(
+        store, runner, {key: sid for key, (sid, _ids) in retired.items()}, all_ids)
     report["routes_dropped"] = len(dropped)
+    if save_error is not None:
+        _pending(owner)["needs_save"] = True
     for key in dropped:
-        try:
-            if _evict_retired_agent(runner, key, retired[key]):
-                report["agents_evicted"] += 1
-        except Exception:
-            logger.debug("Idle sweep: agent eviction failed for %s", key, exc_info=True)
+        _evict_or_remember(runner, owner, key, retired[key][1], report)
     if save_error is not None:
         raise save_error
 
@@ -258,6 +344,9 @@ def sweep_idle_messaging_sessions(runner: Any, *, profile: str = "") -> dict[str
         if since is not None and since < interval_s:
             report["skipped"] = "interval"
             return report
+        # First, what an earlier failed run could not finish (save of an in-memory drop,
+        # evictions that raised); only then this run's own work.
+        _retry_pending(runner, store, owner, report)
         exclude = _busy_session_ids(runner, store, owner)
         ended = db.end_idle_sessions(
             sources=sources, max_idle_seconds=hours * 3600, end_reason="idle",
@@ -281,15 +370,37 @@ def sweep_idle_messaging_sessions(runner: Any, *, profile: str = "") -> dict[str
         release_or_close(db)
 
 
-def run_idle_sweep_guarded(runner: Any, *, profile: str = "") -> Optional[dict[str, Any]]:
-    """``sweep_idle_messaging_sessions`` for the housekeeping loop: a failure is WARNED at most
-    once per ``_WARN_INTERVAL_S`` per profile (debug otherwise), so a broken sweep stays visible
-    without a warning on every 60-second tick. Never raises."""
+def _retry_wait_s(failures: int) -> float:
+    """Backoff before the next attempt after *failures* consecutive failures, capped at the
+    configured sweep interval (the cadence a healthy sweep would have anyway)."""
+    from hermes_cli.config import load_config
     try:
-        return sweep_idle_messaging_sessions(runner, profile=profile)
+        cfg = load_config().get("sessions") or {}
+        interval_s = float(cfg.get("messaging_idle_interval_minutes", 60) or 0) * 60
+    except Exception:
+        interval_s = 3600.0
+    if interval_s <= 0:
+        interval_s = 3600.0
+    return min(interval_s, _BACKOFF_BASE_S * (2 ** max(0, failures - 1)))
+
+
+def run_idle_sweep_guarded(runner: Any, *, profile: str = "") -> Optional[dict[str, Any]]:
+    """``sweep_idle_messaging_sessions`` for the housekeeping loop. After a failed run the next
+    attempt for that profile waits ``min(interval, 300 s * 2**(n-1))`` (n consecutive failures,
+    reset on success) instead of retrying every tick, and a failure is WARNED at most once per
+    ``_WARN_INTERVAL_S`` per profile (debug otherwise), so a broken sweep stays visible without
+    hammering a broken store. Never raises."""
+    label = profile or "default"
+    failed = _FAILURES.get(label)
+    if failed is not None:
+        count, failed_at = failed
+        if time.monotonic() - failed_at < _retry_wait_s(count):
+            return None
+    try:
+        result = sweep_idle_messaging_sessions(runner, profile=profile)
     except Exception as exc:
-        label = profile or "default"
         now = time.monotonic()
+        _FAILURES[label] = ((failed[0] if failed else 0) + 1, now)
         last = _WARNED_AT.get(label)
         if last is None or now - last >= _WARN_INTERVAL_S:
             _WARNED_AT[label] = now
@@ -297,3 +408,5 @@ def run_idle_sweep_guarded(runner: Any, *, profile: str = "") -> Optional[dict[s
         else:
             logger.debug("Messaging idle sweep (%s) failed again: %s", label, exc)
         return None
+    _FAILURES.pop(label, None)
+    return result
