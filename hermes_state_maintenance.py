@@ -228,6 +228,14 @@ class SessionMaintenanceMixin:
         a recoverable reason (``startup_orphan_reap``) would let the next message reopen the row with
         its full history.  Pinned rows are spared unless ``exclude_pinned=False``; live turn leases and
         compression locks always spare the row.  No gateway-heartbeat gate: the owner is the caller.
+
+        ``limit`` = max rows ENDED per call, oldest first (by canonical last activity).  ``exclude_ids``
+        are filtered in SQL and guard-rejected rows are paged past, so held or busy rows at the head of
+        the order cannot starve eligible rows behind them.  The extra scanning is bounded: at most
+        ``limit * 4`` candidates are inspected per call (expired guards are still reclaimed as they are
+        inspected), so a store full of guarded rows cannot hold the write lock indefinitely — the
+        remainder waits for the next call.  One ``BEGIN IMMEDIATE`` transaction: SELECT pages,
+        guard checks and UPDATEs.
         """
         if end_reason not in _RESET_END_REASONS:
             raise ValueError(
@@ -235,30 +243,55 @@ class SessionMaintenanceMixin:
         srcs = tuple(s for s in sources if s)
         if max_idle_seconds <= 0 or limit <= 0 or not srcs:
             return []
+        limit = int(limit)
+        scan_bound = limit * 4
         cutoff = time.time() - max_idle_seconds
         last_active = _sql_session_last_active("sessions")
         pin_scope = f" AND {_not_pinned_sql('sessions')}" if exclude_pinned else ""
-        scope_sql = (f" AND source IN ({_placeholders(srcs)}){pin_scope}"
+        excluded = tuple(sorted({str(x) for x in exclude_ids if x}))
+        exclude_sql = f" AND id NOT IN ({_placeholders(excluded)})" if excluded else ""
+        scope_sql = (f" AND source IN ({_placeholders(srcs)}){pin_scope}{exclude_sql}"
                      f" AND started_at < ? AND {last_active} < ?")
-        scope_params = (*srcs, cutoff, cutoff)
+        scope_params = (*srcs, *excluded, cutoff, cutoff)
         def _do(conn):
-            rows = conn.execute(
-                f"SELECT id FROM sessions WHERE ended_at IS NULL{scope_sql}"
-                f" ORDER BY {last_active} ASC, started_at ASC LIMIT ?",
-                (*scope_params, int(limit))).fetchall()
-            excluded = {str(x) for x in exclude_ids if x}
-            victims = [sid for sid in (str(row["id"]) for row in rows)
-                       if sid not in excluded and not self._write_guards_reject(conn, sid)]
             ended: list[str] = []
+            scanned = 0
+            # Keyset cursor on the ORDER BY (last_active, started_at, id): guard-rejected rows are left
+            # behind, not re-fetched, so each page advances past them.
+            cursor = None
             now = time.time()
-            for sid in victims:
-                # Re-apply every predicate under the write lock; only a row this statement actually
-                # ended advances the peer's conversation generation.
-                if self._end_and_bump(
-                        conn, f"UPDATE sessions SET ended_at = ?, end_reason = ?"
-                              f" WHERE id = ? AND ended_at IS NULL{scope_sql}",
-                        (now, end_reason, sid, *scope_params), sid, end_reason):
-                    ended.append(sid)
+            while len(ended) < limit and scanned < scan_bound:
+                page = min(limit - len(ended), scan_bound - scanned)
+                keyset_sql, keyset_params = "", ()
+                if cursor is not None:
+                    keyset_sql = (f" AND ({last_active} > ? OR ({last_active} = ? AND started_at > ?)"
+                                  f" OR ({last_active} = ? AND started_at = ? AND id > ?))")
+                    la, st, sid_ = cursor
+                    keyset_params = (la, la, st, la, st, sid_)
+                rows = conn.execute(
+                    f"SELECT id, started_at, {last_active} AS _last_active FROM sessions"
+                    f" WHERE ended_at IS NULL{scope_sql}{keyset_sql}"
+                    f" ORDER BY _last_active ASC, started_at ASC, id ASC LIMIT ?",
+                    (*scope_params, *keyset_params, page)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    sid = str(row["id"])
+                    scanned += 1
+                    cursor = (row["_last_active"], row["started_at"], sid)
+                    if self._write_guards_reject(conn, sid):
+                        continue
+                    # Re-apply every predicate under the write lock; only a row this statement actually
+                    # ended advances the peer's conversation generation.
+                    if self._end_and_bump(
+                            conn, f"UPDATE sessions SET ended_at = ?, end_reason = ?"
+                                  f" WHERE id = ? AND ended_at IS NULL{scope_sql}",
+                            (now, end_reason, sid, *scope_params), sid, end_reason):
+                        ended.append(sid)
+                        if len(ended) >= limit:
+                            break
+                if len(rows) < page:
+                    break  # candidates exhausted
             return ended
         return self._execute_write(_do) or []
 
