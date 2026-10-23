@@ -3231,9 +3231,9 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 file_uploads, initial_comment_parts = await self._collect_image_uploads(
                     chunk, _unquote, _is_safe_url, create_ssrf_safe_async_client)
-                if len(file_uploads) < len(chunk):
-                    partial = True  # some images could not be fetched/read
+                chunk_partial = len(file_uploads) < len(chunk)  # some images could not be fetched/read
                 if not file_uploads:
+                    partial = partial or chunk_partial
                     continue
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
                 logger.info(
@@ -3244,6 +3244,7 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts)
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 delivered = True
+                partial = partial or chunk_partial
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -3251,6 +3252,8 @@ class SlackAdapter(BasePlatformAdapter):
                 fallback = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay)
                 delivered = delivered or fallback.success
+                # The per-image fallback resends the WHOLE chunk, so its outcome replaces this
+                # chunk's provisional collection loss (earlier chunks keep theirs).
                 partial = partial or not fallback.success or fallback.error_kind == "partial"
         if delivered and partial:
             return SendResult(success=True, error="some images failed to send", error_kind="partial")
