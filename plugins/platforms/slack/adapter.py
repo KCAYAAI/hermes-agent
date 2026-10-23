@@ -5318,6 +5318,80 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             },
         ]
 
+    def _curated_model_picker_entries(self) -> list[dict]:
+        """KC: ``slack.model_picker`` — an ordered, profile-scoped list of
+        ``{label, model, provider[, description]}`` rows. When set, ``/model``
+        shows exactly these rows in one select instead of the provider
+        drill-down. Rows missing a field or repeating a ``(provider, model)``
+        pair are dropped; unset or empty keeps the stock picker."""
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        raw = extra.get("model_picker")
+        if not isinstance(raw, list):
+            return []
+        entries: list[dict] = []
+        seen: set = set()
+        for row in raw[:100]:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("label") or "").strip()
+            model = str(row.get("model") or "").strip()
+            provider = str(row.get("provider") or "").strip()
+            if not (label and model and provider) or (provider, model) in seen:
+                continue
+            seen.add((provider, model))
+            entry = {"label": label, "model": model, "provider": provider}
+            description = str(row.get("description") or "").strip()
+            if description:
+                entry["description"] = description
+            entries.append(entry)
+        return entries
+
+    def _build_curated_model_picker_blocks(
+        self, entries: list[dict], current_model: str, current_provider: str
+    ) -> list[dict]:
+        """One-stage picker for ``slack.model_picker``: a single model select
+        (option value = row index) plus Cancel. Shows the curated label of the
+        current route when it is one of the rows, never a raw slug suffix."""
+        options = []
+        current_label = ""
+        for idx, entry in enumerate(entries):
+            option: dict[str, Any] = {
+                "text": {"type": "plain_text", "text": entry["label"][:75], "emoji": True},
+                "value": str(idx),
+            }
+            if entry.get("description"):
+                option["description"] = {
+                    "type": "plain_text", "text": entry["description"][:75], "emoji": True}
+            options.append(option)
+            if entry["model"] == current_model and entry["provider"] == current_provider:
+                current_label = entry["label"]
+        section_text = (
+            f"*⚙ Model Configuration*\n"
+            f"Current model: `{current_label or current_model or 'unknown'}`\n\n"
+            f"Select a model:"
+        )
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": section_text[:3000]}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "static_select",
+                        "placeholder": {"type": "plain_text", "text": "Choose a model…", "emoji": True},
+                        "action_id": _MODEL_PICKER_MODEL_ACTION,
+                        "options": options,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                        "style": "danger",
+                        "action_id": _MODEL_PICKER_CANCEL_ACTION,
+                        "value": "cancel",
+                    },
+                ],
+            },
+        ]
+
     def _build_model_picker_model_blocks(self, providers: list, provider_slug: str) -> list[dict]:
         """Build the model-select stage for a chosen provider.
 
@@ -5408,12 +5482,18 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             except Exception:
                 provider_label = current_provider
 
-            if not providers:
+            curated = self._curated_model_picker_entries()
+            if not providers and not curated:
                 return SendResult(success=False, error="No providers available")
 
-            blocks = self._build_model_picker_provider_blocks(
-                providers, current_model, provider_label
-            )
+            if curated:
+                blocks = self._build_curated_model_picker_blocks(
+                    curated, current_model, current_provider
+                )
+            else:
+                blocks = self._build_model_picker_provider_blocks(
+                    providers, current_model, provider_label
+                )
 
             kwargs: dict[str, Any] = {
                 "channel": chat_id,
@@ -5441,8 +5521,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "on_model_selected": on_model_selected,
-                "stage": "provider",
+                "stage": "curated" if curated else "provider",
                 "selected_provider_slug": "",
+                "curated": curated,
             }
             self._trim_oldest_dict_entries(
                 self._model_picker_state, self._MODEL_PICKER_STATE_MAX
@@ -5597,17 +5678,30 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             return
 
         # Model selected → run the switch.
-        if action_id == _MODEL_PICKER_MODEL_ACTION and state.get("stage") == "model":
+        if action_id == _MODEL_PICKER_MODEL_ACTION and state.get("stage") in ("model", "curated"):
             selected = action.get("selected_option", {})
             idx_token = selected.get("value", "")
-            provider_slug = state.get("selected_provider_slug", "")
-            provider = next((p for p in providers if p["slug"] == provider_slug), None)
-            models = (provider or {}).get("models", [])
-            try:
-                idx = int(idx_token)
-                model_id = models[idx] if idx >= 0 else None
-            except (ValueError, IndexError, TypeError):
-                model_id = None
+            if state.get("stage") == "curated":
+                # KC curated picker: the row carries its own provider + model.
+                entries = state.get("curated") or []
+                try:
+                    idx = int(idx_token)
+                    entry = entries[idx] if idx >= 0 else None
+                except (ValueError, IndexError, TypeError):
+                    entry = None
+                model_id = entry["model"] if entry else None
+                provider_slug = entry["provider"] if entry else ""
+                display_name = entry["label"] if entry else ""
+            else:
+                display_name = ""
+                provider_slug = state.get("selected_provider_slug", "")
+                provider = next((p for p in providers if p["slug"] == provider_slug), None)
+                models = (provider or {}).get("models", [])
+                try:
+                    idx = int(idx_token)
+                    model_id = models[idx] if idx >= 0 else None
+                except (ValueError, IndexError, TypeError):
+                    model_id = None
             if model_id is None:
                 # Message and stored state are out of sync — kill the picker
                 # visibly instead of leaving a dead control.
@@ -5628,7 +5722,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             # Pop the state up-front (double-click guard, mirrors approval).
             self._model_picker_state.pop(marker, None)
             await self._update_picker_message(
-                channel_id, team_id, msg_ts, t("platform.slack.picker.switching", model=model_id)
+                channel_id, team_id, msg_ts, t("platform.slack.picker.switching", model=display_name or model_id)
             )
 
             switch_failed = False
