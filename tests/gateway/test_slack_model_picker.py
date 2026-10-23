@@ -729,3 +729,141 @@ class TestSlackModelPickerGatewayIntegration:
 
         assert isinstance(result, str)
         assert "old-model" in result
+
+
+# ===========================================================================
+# KC curated picker — ``slack.model_picker`` (profile-scoped fixed list)
+# ===========================================================================
+
+_CURATED = [
+    {"label": "Opus 5.5", "provider": "claude-subscription-directsdk-experimental", "model": "claude-opus-5-5[1m]"},
+    {"label": "Sonnet 5.5", "provider": "claude-subscription-directsdk-experimental", "model": "claude-sonnet-5-5[1m]"},
+    {"label": "GPT 6.1 Sol", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+    {"label": "GPT 6 Luna", "provider": "openai-codex", "model": "gpt-6-luna-900k"},
+    {"label": "GPT 6 Astra", "provider": "openai-codex", "model": "gpt-6-astra-900k"},
+]
+
+
+def _make_curated_adapter(rows=None):
+    adapter = _make_adapter()
+    adapter.config.extra["model_picker"] = list(_CURATED if rows is None else rows)
+    return adapter
+
+
+class TestSlackCuratedModelPicker:
+
+    @pytest.mark.asyncio
+    async def test_curated_list_replaces_provider_drilldown(self):
+        adapter = _make_curated_adapter()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        result = await adapter.send_model_picker(
+            chat_id="C1", providers=_PROVIDERS, current_model="gpt-6.1-sol",
+            current_provider="openai-codex", session_key="s1",
+            on_model_selected=AsyncMock(return_value="ok"))
+
+        assert result.success is True
+        blocks = client.chat_postMessage.call_args[1]["blocks"]
+        select, cancel = blocks[1]["elements"]
+        assert select["action_id"] == "hermes_model_model"
+        labels = [o["text"]["text"] for o in select["options"]]
+        assert labels == ["Opus 5.5", "Sonnet 5.5", "GPT 6.1 Sol", "GPT 6 Luna", "GPT 6 Astra"]
+        assert [o["value"] for o in select["options"]] == ["0", "1", "2", "3", "4"]
+        assert cancel["action_id"] == "hermes_model_cancel"
+        # Current route shown by curated label, not raw slug or context suffix.
+        assert "`GPT 6.1 Sol`" in blocks[0]["text"]["text"]
+        rendered = str(blocks)
+        for leak in ("900k", "1m]", "OpenRouter", "hermes_model_provider"):
+            assert leak not in rendered
+        state = adapter._model_picker_state["1234.5678"]  # no metadata → bare ts key
+        assert state["stage"] == "curated"
+
+    @pytest.mark.asyncio
+    async def test_curated_rows_work_with_empty_provider_list(self):
+        adapter = _make_curated_adapter()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+        result = await adapter.send_model_picker(
+            chat_id="C1", providers=[], current_model="x", current_provider="y",
+            session_key="s1", on_model_selected=AsyncMock())
+        assert result.success is True
+
+    def test_invalid_and_duplicate_rows_dropped(self):
+        adapter = _make_curated_adapter(rows=[
+            _CURATED[0], dict(_CURATED[0], label="Opus dup"),
+            {"label": "", "provider": "p", "model": "m"},
+            {"label": "No provider", "model": "m"},
+            "not-a-dict", _CURATED[2],
+        ])
+        assert [e["label"] for e in adapter._curated_model_picker_entries()] == ["Opus 5.5", "GPT 6.1 Sol"]
+
+    def test_unset_keeps_stock_picker(self):
+        adapter = _make_adapter()
+        assert adapter._curated_model_picker_entries() == []
+        adapter.config.extra["model_picker"] = "nope"
+        assert adapter._curated_model_picker_entries() == []
+
+    @pytest.mark.asyncio
+    async def test_unset_sends_stock_provider_stage(self):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+        await adapter.send_model_picker(
+            chat_id="C1", providers=_PROVIDERS, current_model="m", current_provider="openrouter",
+            session_key="s1", on_model_selected=AsyncMock())
+        blocks = client.chat_postMessage.call_args[1]["blocks"]
+        assert blocks[1]["elements"][0]["action_id"] == "hermes_model_provider"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("idx", range(5))
+    async def test_each_row_switches_to_its_own_provider_and_model(self, idx):
+        adapter = _make_curated_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        client.chat_update = AsyncMock()
+        seen = []
+
+        async def on_selected(chat_id, model_id, provider_slug):
+            seen.append((chat_id, model_id, provider_slug))
+            return "✅ switched"
+
+        await adapter.send_model_picker(
+            chat_id="C1", providers=_PROVIDERS, current_model="old", current_provider="openrouter",
+            session_key="s1", on_model_selected=on_selected)
+        await adapter._handle_model_picker_action(
+            AsyncMock(), _interaction_body(),
+            {"action_id": "hermes_model_model", "selected_option": {"value": str(idx)}})
+
+        row = _CURATED[idx]
+        assert seen == [("C1", row["model"], row["provider"])]
+        switching = client.chat_update.call_args_list[0][1]["text"]
+        assert switching == f"⚙ Switching to `{row['label']}`…"
+        assert "⚙ Model Switched" in client.chat_update.call_args_list[-1][1]["text"]
+        assert not adapter._model_picker_state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("token", ["5", "-1", "x"])
+    async def test_curated_bad_index_expires_without_switch(self, token):
+        adapter = _make_curated_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        client.chat_update = AsyncMock()
+        cb = AsyncMock()
+        await adapter.send_model_picker(
+            chat_id="C1", providers=_PROVIDERS, current_model="old", current_provider="openrouter",
+            session_key="s1", on_model_selected=cb)
+        await adapter._handle_model_picker_action(
+            AsyncMock(), _interaction_body(),
+            {"action_id": "hermes_model_model", "selected_option": {"value": token}})
+        cb.assert_not_called()
+        assert not adapter._model_picker_state
+
+    def test_root_slack_block_bridges_model_picker_into_extra(self):
+        from gateway.config_loader import bridge_platform_shared_keys
+        yaml_cfg = {"slack": {"model_picker": _CURATED}}
+        platforms_data: dict = {}
+        bridge_platform_shared_keys(yaml_cfg, None, {}, platforms_data, [Platform.SLACK])
+        assert platforms_data["slack"]["extra"]["model_picker"] == _CURATED
