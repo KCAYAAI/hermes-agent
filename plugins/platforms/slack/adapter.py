@@ -5686,6 +5686,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                 "stage": "curated" if curated else "provider",
                 "selected_provider_slug": "",
                 "curated": curated,
+                # The commit callback carries the opener's identity and scope (an admin's
+                # `/model --global` included), so only the opener may drive this picker.
+                "owner_user_id": str((metadata or {}).get("user_id") or ""),
             }
             self._trim_oldest_dict_entries(
                 self._model_picker_state, self._MODEL_PICKER_STATE_MAX
@@ -5752,6 +5755,14 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             # (mirrors the clarify handler's expiry notice).
             await self._update_picker_message(
                 channel_id, team_id, msg_ts, _model_picker_expired_notice()
+            )
+            return
+
+        owner = state.get("owner_user_id") or ""
+        if owner and user_id != owner:
+            logger.warning(
+                "[Slack] Model picker click by %s (%s) ignored: the picker belongs to %s",
+                user_name, user_id, owner,
             )
             return
 
@@ -6607,7 +6618,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         await self._handle_slash_command(command)
 
     async def _thread_root_sender_verified(
-        self, root: Dict[str, Any], channel_id: str, team_id: str) -> bool:
+        self, root: dict[str, Any], channel_id: str, team_id: str) -> bool:
         """True only for a root posted by an active human Slack user (no bot/app/webhook author)
         who also passes this profile's sender authorization (excludes outside guests)."""
         user_id = str(root.get("user") or "")
