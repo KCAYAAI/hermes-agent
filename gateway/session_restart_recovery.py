@@ -208,12 +208,40 @@ def rerun_notice(_verdict: Verdict) -> str:
             'so the request is running again.')
 
 
-def thread_notice(verdict: Verdict) -> str:
-    """One short message to the person when their fresh turn cannot continue on its own."""
-    steps = (f' These steps may or may not have finished: {_names(verdict.unsettled)}.'
-             if verdict.unsettled else '')
-    return ('♻️ Hermes restarted while working on this.' + steps
-            + ' Reply here (for example "continue") and I will pick it up and check anything that may already have run.')
+def _notice_setting(config, key: str) -> str:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    default = DEFAULT_CONFIG['gateway'][key]
+    gateway = config.get('gateway') if isinstance(config, dict) else None
+    value = gateway.get(key) if isinstance(gateway, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def thread_notice(verdict: Verdict, config=None) -> str:
+    """One short message to the person when their fresh turn cannot continue on its own.
+
+    Wording comes from the owning profile's ``gateway.restart_recovery_notice`` (always sent) and
+    ``gateway.restart_recovery_notice_steps`` (appended when steps are unsettled; ``{steps}`` is
+    replaced by their names). Plain replacement, never ``str.format``: stray braces cannot raise.
+    """
+    text = _notice_setting(config, 'restart_recovery_notice')
+    if verdict.unsettled:
+        steps = _notice_setting(config, 'restart_recovery_notice_steps')
+        names = _names(verdict.unsettled)
+        text += ' ' + (steps.replace('{steps}', names) if '{steps}' in steps else f'{steps} ({names})')
+    return text
+
+
+def _owner_config(authority):
+    """The owning profile's config for notice wording; None (defaults) when it cannot be read."""
+    try:
+        from gateway.session_authorities import owner_scope
+        from gateway.session_policy import profile_config
+        with owner_scope(authority):  # ${VAR} references expand in the owning profile's scope
+            return profile_config(authority)
+    except Exception:
+        logger.warning('Could not read restart notice wording for %s; using the default',
+                       getattr(authority, 'profile_id', '?'), exc_info=True)
+        return None
 
 
 def attempts(db, admission_id) -> int:
@@ -523,7 +551,8 @@ async def recover_person_unknown(authority, ref) -> bool:
             if current is None or current['status'] != 'unknown':
                 return True
             try:
-                await send_to_thread(authority, head, thread_notice(verdict))
+                config = await asyncio.to_thread(_owner_config, authority)
+                await send_to_thread(authority, head, thread_notice(verdict, config))
             except Exception:
                 logger.warning('Restart notice for admission %s not sent', head['admission_id'], exc_info=True)
         return False
