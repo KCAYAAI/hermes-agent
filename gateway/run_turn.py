@@ -2080,26 +2080,25 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             ):
                 break
             _elapsed_mins = int((time.time() - _notify_start) // 60)
-            # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
-            _status_detail = ""
-            _want_iteration_detail = bool(
-                disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True)
-            )
-            _a = self._agent_activity_summary(agent_holder[0])
+            # Plain check-in: elapsed time, the current step in friendly words, plus plugin lines
+            # (e.g. subagent progress). No commands or file paths; the iteration counter is opt-in.
+            from gateway.progress_text import extra_progress_lines, heartbeat_text
+            _a = self._agent_activity_summary(agent_holder[0]) or {}
+            # Upstream's iteration counter stays opt-in through display busy_ack_detail.
+            _iteration = ""
             with suppress(Exception):
-                if _a:
-                    _parts = []
-                    if _want_iteration_detail:
-                        _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                    if _action:
-                        _parts.append(str(_action))
-                    if _parts:
-                        _status_detail = " — " + ", ".join(_parts)
+                if _a and bool(disp.resolve_display_setting(
+                        disp.user_config, disp.platform_key, "busy_ack_detail", True)):
+                    _iteration = format_iteration_progress(_a["api_call_count"], _a["max_iterations"])
+            _extra = extra_progress_lines(
+                chat_id=str(source.chat_id),
+                message_ids={str(m) for m in (turn_ctx.event_message_id, turn_ctx.inbound_message_id) if m},
+                profile=getattr(source, "profile", None),
+            )
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
-                else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
+                else heartbeat_text(_elapsed_mins, _a.get("current_tool"), _extra, _iteration)
             )
             try:
                 _notify_res = None
