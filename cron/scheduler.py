@@ -3218,8 +3218,17 @@ def _install_fire_secret_scope() -> tuple[contextvars.Token, Optional[contextvar
 
     home = Path(_get_hermes_home())
     hydrate_profile_secret_sources(home)
-    scope_token = set_secret_scope(owner_secret_scope(home), profile_home=str(home))
-    context_token = set_multiplex_context(True) if routed_profile_fire() else None
+    # Everything that can raise runs BEFORE binding: a failure must never leave a scope installed
+    # on a long-lived ticker thread (the caller only resets tokens it got back).
+    routed = routed_profile_fire()
+    mapping = owner_secret_scope(home)
+    scope_token = set_secret_scope(mapping, profile_home=str(home))
+    try:
+        context_token = set_multiplex_context(True) if routed else None
+    except BaseException:
+        from agent.secret_scope import reset_secret_scope
+        reset_secret_scope(scope_token)
+        raise
     return scope_token, context_token
 
 
