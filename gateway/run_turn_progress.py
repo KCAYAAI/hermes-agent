@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import dataclasses
 import logging
 import queue
@@ -401,6 +402,8 @@ class GatewayTurnProgressMixin:
         # dynamically so the state is visible where it lives.
         publication_suppressed: bool = False
         anonymous_seq: int = 0
+        # An applied event not yet published (a cancelled publish must not lose the final state).
+        dirty: bool = False
         started: float = dataclasses.field(default_factory=time.monotonic)
         VISIBLE: ClassVar[int] = 5
 
@@ -477,12 +480,35 @@ class GatewayTurnProgressMixin:
                     task["recovered"] = True
                     task["title"] = self._compact(f"{task['title']} (error, recovered)")
 
+    def _progress_stopped(self) -> bool:
+        """True once turn cleanup began (absent on older/synthetic contexts: never stopped)."""
+        stop = getattr(self._ctx, "_progress_stop", None)
+        return bool(stop is not None and stop.is_set())
+
+    def _task_card_owner_kwargs(self, fn) -> dict:
+        """Pass this turn's card owner only to adapters that NAME an ``owner`` parameter. A bare
+        ``**kwargs`` is not enough: wrappers commonly forward it to a parent without one."""
+        owner = getattr(self._ctx, "_progress_owner", None)
+        if not isinstance(owner, str) or not owner:
+            return {}
+        try:
+            param = inspect.signature(fn).parameters.get("owner")
+        except (TypeError, ValueError):
+            return {}
+        if param is None or param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return {}
+        return {"owner": owner}
+
     async def _task_card_send_or_edit_fallback(self, st) -> None:
         ctx = self._ctx
         text = st.fallback_text()
         from gateway.relay.egress import declined_send
 
         if st.publication_suppressed:
+            return
+        if self._progress_stopped() and not st.fallback_msg_id:
+            # Closing: never open a NEW text bubble beside (or after) the final reply. Editing an
+            # existing fallback to its final state is still allowed.
             return
         if st.fallback_msg_id:
             result = await st.adapter.edit_message(
@@ -526,9 +552,11 @@ class GatewayTurnProgressMixin:
             if st.publication_suppressed:
                 return
         if not st.native_failed:
-            result = await st.adapter.send_native_task_card_progress(
+            _send = st.adapter.send_native_task_card_progress
+            result = await _send(
                 chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=st.title(),
                 reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
+                **self._task_card_owner_kwargs(_send),
             )
             if getattr(result, "success", False):
                 # The native card is temporary progress UI like any bubble: with cleanup_progress it
@@ -607,25 +635,40 @@ class GatewayTurnProgressMixin:
         """
         ctx = self._ctx
         st = self._TaskCardState(adapter)
+        cancelled = False
         try:
-            while ctx._run_still_current():
+            # The stop flag ends the loop even when a transport swallowed the cleanup cancel.
+            while ctx._run_still_current() and not self._progress_stopped():
                 try:
                     raw = ctx.progress_queue.get_nowait()
                 except queue.Empty:
                     await asyncio.sleep(0.1)
                     continue
                 if not self._agent_interrupted() and st.apply_event(raw):
+                    st.dirty = True
                     await self._task_card_publish(st)
+                    st.dirty = False
         except asyncio.CancelledError:
-            if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
+            cancelled = True
+        try:
+            # One terminal flush on close: newly queued events, or an applied event whose publish
+            # was cut off by the cancel (dirty) so the card's final state is not lost.
+            if (cancelled or self._progress_stopped()) and (self._task_card_drain(st) or st.dirty) \
+                    and ctx._run_still_current() and not self._agent_interrupted():
                 await self._task_card_publish(st)
+                st.dirty = False
+        except asyncio.CancelledError:
+            pass
         finally:
             if hasattr(adapter, "stop_native_task_card_progress"):
                 # Best-effort on the turn-cleanup path: an escaping transport exception would skip
-                # final-delivery logic (cleanup awaits catch only CancelledError).
+                # final-delivery logic (cleanup awaits catch only CancelledError). Owner-scoped: a
+                # late stop from this turn never closes a newer turn's card in the same thread.
+                _stop = adapter.stop_native_task_card_progress
                 try:
-                    await adapter.stop_native_task_card_progress(
+                    await _stop(
                         ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+                        **self._task_card_owner_kwargs(_stop),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -876,6 +919,10 @@ class GatewayTurnProgressMixin:
             try:
                 if not ctx._run_still_current():
                     self._drain_progress_queue()
+                    return
+                if self._progress_stopped():
+                    # Cleanup began; a swallowed cancel must not keep this loop alive.
+                    await self._drain_progress_on_cancel(st)
                     return
                 raw = ctx.progress_queue.get_nowait()
                 # Drain silently when interrupted: events queued in the window between tool parse
