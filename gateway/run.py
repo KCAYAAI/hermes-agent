@@ -2086,6 +2086,8 @@ def _bridge_config_to_env(_cfg: dict) -> None:
     _security_cfg = _cfg.get("security", {})
     if isinstance(_security_cfg, dict) and _security_cfg.get("redact_secrets") is not None:
         os.environ["HERMES_REDACT_SECRETS"] = str(_security_cfg["redact_secrets"]).lower()
+    if isinstance(_security_cfg, dict) and _security_cfg.get("redact_phones") is not None:
+        os.environ["HERMES_REDACT_PHONES"] = str(_security_cfg["redact_phones"]).lower()
     # Media policy uses the shared bridge so standalone entrypoints (`hermes cron run`) match.
     _gateway_cfg = _cfg.get("gateway", {})
     if isinstance(_gateway_cfg, dict):
