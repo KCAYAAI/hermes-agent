@@ -1752,6 +1752,10 @@ DEFAULT_CONFIG = {
         # dials them instead of rejecting them as private. Empty = normal private-address verdict.
         "fake_ip_ranges": [],
         "redact_secrets": True,
+        # Mask E.164 phone numbers (+15551234567 -> +155****4567) in tool output. Separate from
+        # redact_secrets: phone numbers are contact data that dispatch/SMS/CRM workflows need whole.
+        # Also applies to final replies sent to chat platforms (they pass the same redactor).
+        "redact_phones": True,
         # Persisted acknowledgement for unattended model overrides whose tier lets the vendor train
         # on prompts. The startup guard still warns every run; cost guards are unaffected.
         "allow_data_training_tiers_noninteractive": False,
