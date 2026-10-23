@@ -424,7 +424,18 @@ class GatewayTurnProgressMixin:
         # An applied event not yet published (a cancelled publish must not lose the final state).
         dirty: bool = False
         started: float = dataclasses.field(default_factory=time.monotonic)
+        # Consecutive transient (retryable) card failures. A timeout is not a broken card: the
+        # next frame carries the full projection to the same card. Only a run of them, or a
+        # permanent failure, moves the turn to the editable text fallback.
+        transient_failures: int = 0
+        retry_at: Optional[float] = None  # monotonic time of the next resend after a transient failure
+        # A card frame succeeded this turn, so the card is visible. From then on a failure never
+        # opens a text bubble beside it: transient ones retry, a permanent one freezes the card.
+        card_live: bool = False
         VISIBLE: ClassVar[int] = 5
+        MAX_TRANSIENT: ClassVar[int] = 3
+        RETRY_BACKOFF: ClassVar[float] = 2.0  # seconds x consecutive failures, capped at MAX_BACKOFF
+        MAX_BACKOFF: ClassVar[float] = 10.0
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
@@ -576,6 +587,8 @@ class GatewayTurnProgressMixin:
             self._task_card_uncardable_destination(st)
             if st.publication_suppressed:
                 return
+        if st.native_failed and getattr(st, "card_live", False):
+            return  # the card failed permanently after it was shown: frozen, no text beside it
         if not st.native_failed:
             _send = st.adapter.send_native_task_card_progress
             result = await _send(
@@ -587,6 +600,7 @@ class GatewayTurnProgressMixin:
                 # The native card is temporary progress UI like any bubble: with cleanup_progress it
                 # is deleted after the final reply is delivered, and kept on a failed run.
                 self._track_progress_result(result)
+                st.transient_failures, st.retry_at, st.card_live = 0, None, True
                 return
             # P5(b): an AUTHORIZATION decline is not a broken card lane. The
             # fallback below sends the same task text to the same chat, which
@@ -608,12 +622,33 @@ class GatewayTurnProgressMixin:
                     "of this turn (the destination is not approved)"
                 )
                 return
+            if getattr(result, "retryable", False) and not self._progress_stopped():
+                st.transient_failures += 1
+                if getattr(st, "card_live", False) or st.transient_failures < st.MAX_TRANSIENT:
+                    # Keep the card lane. The drain loop resends the full projection after the
+                    # backoff even if no new event arrives (a long tool run stays visible). Once the
+                    # card is visible, transient failures never switch the turn to text.
+                    st.retry_at = time.monotonic() + min(
+                        st.RETRY_BACKOFF * st.transient_failures, st.MAX_BACKOFF)
+                    logger.warning(
+                        "Slack native task card: transient failure %d/%d, keeping the card: %s",
+                        st.transient_failures, st.MAX_TRANSIENT, getattr(result, "error", "unknown error"))
+                    return
             st.native_failed = True
             from gateway.run_turn_runner import _CARD_DESTINATION_REFUSALS
             if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
                 self._task_card_uncardable_destination(st, getattr(result, "error", "unknown error"))
                 if st.publication_suppressed:
                     return
+            elif getattr(st, "card_live", False):
+                logger.warning(
+                    "Slack native task card failed after it was shown; keeping it as last shown "
+                    "(no text bubble beside it): %s", getattr(result, "error", "unknown error"))
+                return
+            elif self._progress_stopped() and not getattr(st, "fallback_msg_id", None):
+                logger.warning("Slack native task card failed while the turn was closing; no text "
+                               "update sent: %s", getattr(result, "error", "unknown error"))
+                return
             else:
                 logger.warning(
                     "Slack native task-card progress failed; falling back "
@@ -667,10 +702,19 @@ class GatewayTurnProgressMixin:
                 try:
                     raw = ctx.progress_queue.get_nowait()
                 except queue.Empty:
+                    if st.retry_at is not None and time.monotonic() >= st.retry_at \
+                            and not st.native_failed and not self._agent_interrupted():
+                        # dirty until the resend lands: a cancel mid-resend still gets the close flush.
+                        st.retry_at, st.dirty = None, True
+                        await self._task_card_publish(st)
+                        st.dirty = False
+                        continue
                     await asyncio.sleep(0.1)
                     continue
                 if not self._agent_interrupted() and st.apply_event(raw):
                     st.dirty = True
+                    if st.retry_at is not None and time.monotonic() < st.retry_at:
+                        continue  # backing off: the due resend carries this event's state
                     await self._task_card_publish(st)
                     st.dirty = False
         except asyncio.CancelledError:
@@ -678,7 +722,9 @@ class GatewayTurnProgressMixin:
         try:
             # One terminal flush on close: newly queued events, or an applied event whose publish
             # was cut off by the cancel (dirty) so the card's final state is not lost.
-            if (cancelled or self._progress_stopped()) and (self._task_card_drain(st) or st.dirty) \
+            # A pending transient-failure resend counts too: the card must end on its final state.
+            if (cancelled or self._progress_stopped()) \
+                    and (self._task_card_drain(st) or st.dirty or st.retry_at is not None) \
                     and ctx._run_still_current() and not self._agent_interrupted():
                 await self._task_card_publish(st)
                 st.dirty = False
