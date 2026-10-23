@@ -6229,3 +6229,34 @@ class TestNativeTaskCardAmbiguousStart:
             "C1", [{"id": "c", "title": "t", "status": "in_progress"}], metadata={"thread_id": "th-1"})
         assert result.success is False and result.retryable is True
 
+
+
+class TestMultiImagePartialDelivery:
+    """Review round 3: a chunk's per-image fallback resends the whole chunk, so a full fallback
+    recovery must clear that chunk's provisional collection loss."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_that_delivers_every_image_is_complete(self, adapter, monkeypatch):
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        async def collect(chunk, *a):
+            return [{"file": "/tmp/a.png"}], ["a"]  # one of two images could be read
+
+        monkeypatch.setattr(adapter, "_collect_image_uploads", collect)
+        adapter._app.client.files_upload_v2 = AsyncMock(side_effect=RuntimeError("upload failed"))
+        monkeypatch.setattr(BasePlatformAdapter, "send_multiple_images",
+                            AsyncMock(return_value=SendResult(success=True)))
+        result = await adapter.send_multiple_images(
+            "C1", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+        assert result.success is True and result.error_kind is None
+
+    @pytest.mark.asyncio
+    async def test_uploaded_chunk_with_an_unreadable_image_is_partial(self, adapter, monkeypatch):
+        async def collect(chunk, *a):
+            return [{"file": "/tmp/a.png"}], ["a"]
+
+        monkeypatch.setattr(adapter, "_collect_image_uploads", collect)
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+        result = await adapter.send_multiple_images(
+            "C1", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+        assert result.success is True and result.error_kind == "partial"
