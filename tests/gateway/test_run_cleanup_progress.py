@@ -346,6 +346,54 @@ async def test_queued_followup_starts_after_prior_turn_bubbles_are_deleted(monke
     assert {d["message_id"] for d in QueuedFollowupAgent.deleted_at_turn2_start} >= progress_ids
 
 
+class RefusedFirstResponseAdapter(CleanupCaptureAdapter):
+    """Refuses the first turn's final text (a dead chat, flood control); everything else is sent."""
+
+    def __init__(self, *, refuse: bool):
+        super().__init__()
+        self.refuse = refuse
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if self.refuse and "first" in content:  # the adapter's plain-text retry of it included
+            return SendResult(success=False, error="chat refused the message")
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", [True, False])
+async def test_queued_followup_keeps_bubbles_when_the_first_response_was_not_delivered(
+    monkeypatch, tmp_path, refused
+):
+    """The queued follow-up lane fires the first turn's cleanup itself. It must pass the delivery
+    outcome on, as the adapter does on the normal path: a refused first response keeps the bubbles
+    as the breadcrumb, a delivered one deletes them before the follow-up starts."""
+    adapter = RefusedFirstResponseAdapter(refuse=refused)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, QueuedFollowupAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    session_key = "agent:main:telegram:group:-1001"
+    QueuedFollowupAgent.adapter, QueuedFollowupAgent.session_key = adapter, session_key
+    QueuedFollowupAgent.deleted_at_turn2_start = None
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001"),
+        session_id="sess-1", session_key=session_key,
+    )
+
+    assert result["final_response"] == "second"
+    progress_ids = {m["message_id"] for m in adapter.sent if m["content"] not in ("first", "second")}
+    assert progress_ids
+    assert ("first" in [m["content"] for m in adapter.sent]) is not refused
+    assert QueuedFollowupAgent.deleted_at_turn2_start is not None
+    deleted = {d["message_id"] for d in QueuedFollowupAgent.deleted_at_turn2_start}
+    if refused:
+        assert not (deleted & progress_ids)  # kept: the reply they announce never arrived
+        assert not ({d["message_id"] for d in adapter.deleted} & progress_ids)  # and not deleted later
+    else:
+        assert deleted >= progress_ids
+
+
 class HeldSendAdapter(CleanupCaptureAdapter):
     """Holds every progress send open until the queued follow-up's turn starts."""
 
@@ -472,3 +520,36 @@ async def test_cancelling_the_turn_during_the_sender_wait_starts_no_followup():
     assert events == []
     release.set()
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivered", [False, True])
+async def test_cleanup_keeps_breadcrumbs_when_the_final_reply_was_not_delivered(
+    monkeypatch, tmp_path, delivered
+):
+    """KC review 2026-10-22: the callback fires from the adapter's ``finally`` even when the
+    final send failed; the bubbles must then stay as the breadcrumb."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="sess-1", session_key=session_key)
+    assert result["final_response"] == "done"
+    from gateway.platforms.base import _DELIVERY_OUTCOME
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    token = _DELIVERY_OUTCOME.set((session_key, None, delivered))
+    try:
+        await _fire_post_delivery_cb(cb)
+    finally:
+        _DELIVERY_OUTCOME.reset(token)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+    assert bool(adapter.deleted) is delivered
