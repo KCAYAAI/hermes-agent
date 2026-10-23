@@ -316,6 +316,11 @@ Semantics are honest at-least-once:
 Disable with `gateway.delivery_ledger: false` in `config.yaml` (restores the
 old behavior: in-flight responses are lost on crash).
 
+When a restart cuts a person's turn and it cannot continue on its own, the gateway posts one
+notice in the thread. Set its wording per profile with `gateway.restart_recovery_notice`
+(always sent) and `gateway.restart_recovery_notice_steps` (added when some steps may not have
+finished; `{steps}` becomes their names). Blank values use the built-in wording.
+
 ### Session continuity
 
 Gateway conversations do not reset after inactivity or at a daily boundary. Use `/new`
