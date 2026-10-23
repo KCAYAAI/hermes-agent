@@ -102,6 +102,10 @@ class _StreamExpiredError(Exception):
         self.response = response
 
 
+# Any Slack API error code, same shape (e.g. user_not_found from chat.startStream).
+_SlackApiShapedError = _StreamExpiredError
+
+
 @pytest.fixture(autouse=True)
 def _pin_legacy_assistant_threads_api():
     """Pin the SDK capability probe to the legacy assistant.threads API.
@@ -304,6 +308,132 @@ class TestSlackWorkspaceCollisionIsolation:
         assert build_session_key(first.source) != build_session_key(second.source)
         assert adapter._channel_teams["D_SHARED"] == {"T_ONE", "T_TWO"}
         assert "D_SHARED" not in adapter._channel_team
+
+
+class TestSlackConnectExternalSender:
+    """Externally shared (Slack Connect) channels: a guest from another org must map to OUR
+    installation's workspace, so the message + app_mention deliveries dedupe into one turn and
+    one session (regression: each external @mention ran two parallel agent turns)."""
+
+    HOME, EXT = "T_HOME", "T_EXTERNAL"
+
+    def _ext_event(self, inner_team):
+        return {
+            "type": "message",
+            "text": "<@U_BOT> send it",
+            "user": "U_GUEST",
+            "channel": "C_SHARED",
+            "channel_type": "channel",
+            "ts": "1700000100.000200",
+            "thread_ts": "1700000000.000100",
+            "team": inner_team,
+            "user_team": self.EXT,
+            "source_team": self.EXT,
+        }
+
+    def _envelope(self, team_id):
+        return {
+            "team_id": team_id,
+            "is_ext_shared_channel": True,
+            "authorizations": [{"team_id": self.HOME, "user_id": "U_BOT", "is_bot": True}],
+        }
+
+    @pytest.fixture()
+    def home_adapter(self, adapter):
+        home = AsyncMock()
+        home.users_info = AsyncMock(
+            return_value={"user": {"is_bot": False, "profile": {"display_name": "Guest"}}})
+        adapter._team_clients[self.HOME] = home
+        adapter._team_bot_user_ids[self.HOME] = "U_BOT"
+        return adapter
+
+    def test_receiving_installation_wins_over_sender_org(self, home_adapter):
+        resolve = home_adapter._event_team_id
+        assert resolve(self._ext_event(self.EXT), self._envelope(self.EXT)) == self.HOME
+        assert resolve(self._ext_event(self.EXT), self._envelope(self.HOME)) == self.HOME
+        assert resolve(self._ext_event(self.HOME), self._envelope(self.EXT)) == self.HOME
+        # No authorizations: still prefer the installed workspace among the candidates.
+        assert resolve(self._ext_event(self.EXT), {"team_id": self.HOME}) == self.HOME
+
+    def test_unknown_installation_keeps_legacy_order(self, adapter):
+        # Single-token adapters with no per-team client map keep the old resolution.
+        adapter._team_clients.clear()
+        assert adapter._event_team_id({"team": "T_A"}, {"team_id": "T_B"}) == "T_A"
+        assert adapter._event_team_id({}, {"team_id": "T_B"}) == "T_B"
+        assert adapter._event_team_id({}, {"authorizations": [{"team_id": "T_C"}]}) == "T_C"
+        assert adapter._event_team_id({}, {}) == ""
+
+    @pytest.mark.asyncio
+    async def test_task_card_retries_without_foreign_recipient_user(self, home_adapter):
+        client = AsyncMock()
+        payloads = []
+
+        async def api_call(method, *, json):
+            if method == "chat.startStream":
+                payloads.append(dict(json))
+                if "recipient_user_id" in json:
+                    raise _SlackApiShapedError("user_not_found", {"ok": False, "error": "user_not_found"})
+                return {"ts": "card-1"}
+            return {"ok": True}
+
+        client.api_call.side_effect = api_call
+        home_adapter._team_clients[self.HOME] = client
+        result = await home_adapter.send_native_task_card_progress(
+            "C_SHARED", [{"id": "t1", "title": "Reading", "status": "in_progress"}],
+            metadata={"thread_id": "1700000000.000100", "slack_team_id": self.HOME,
+                      "recipient_team_id": self.HOME, "recipient_user_id": "U_GUEST"})
+
+        assert result.success
+        assert len(payloads) == 2
+        assert payloads[0]["recipient_user_id"] == "U_GUEST"
+        assert "recipient_user_id" not in payloads[1]
+        assert payloads[1]["recipient_team_id"] == self.HOME
+
+    @pytest.mark.asyncio
+    async def test_task_card_other_errors_are_not_retried(self, home_adapter):
+        client = AsyncMock()
+        client.api_call.side_effect = _SlackApiShapedError(
+            "channel_not_found", {"ok": False, "error": "channel_not_found"})
+        home_adapter._team_clients[self.HOME] = client
+        result = await home_adapter.send_native_task_card_progress(
+            "C_SHARED", [{"id": "t1", "title": "Reading", "status": "in_progress"}],
+            metadata={"thread_id": "1700000000.000100", "slack_team_id": self.HOME,
+                      "recipient_user_id": "U_GUEST"})
+        assert not result.success
+        assert client.api_call.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_answer_stream_retries_without_foreign_recipient_user(self, home_adapter):
+        client = AsyncMock()
+        calls = []
+
+        async def start(**kwargs):
+            calls.append(dict(kwargs))
+            if "recipient_user_id" in kwargs:
+                raise _SlackApiShapedError("user_not_found", {"ok": False, "error": "user_not_found"})
+            return {"ts": "stream-1"}
+
+        client.chat_startStream.side_effect = start
+        result = await home_adapter._start_stream(
+            client, (self.HOME, "C_SHARED", "1700000000.000100"), 1, "hello",
+            {"user_id": "U_GUEST"})
+        assert result.success and result.message_id == "stream-1"
+        assert [("recipient_user_id" in c) for c in calls] == [True, False]
+        assert calls[1]["recipient_team_id"] == self.HOME
+
+    @pytest.mark.asyncio
+    async def test_message_and_app_mention_from_guest_run_one_turn(self, home_adapter):
+        from gateway.session import build_session_key
+
+        # Slack delivers the same human message twice (message + app_mention); in a shared
+        # channel the two deliveries can name different teams.
+        await home_adapter._handle_slack_message(self._ext_event(self.EXT), self._envelope(self.EXT))
+        await home_adapter._handle_slack_message(self._ext_event(self.HOME), self._envelope(self.HOME))
+
+        assert home_adapter.handle_message.await_count == 1
+        source = home_adapter.handle_message.await_args_list[0].args[0].source
+        assert source.scope_id == self.HOME
+        assert build_session_key(source).split(":")[4] == self.HOME
 
 
 # ---------------------------------------------------------------------------
