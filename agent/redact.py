@@ -110,6 +110,44 @@ _REDACT_ENABLED_BY_HOME: dict = {}
 _REDACT_ENABLED_LOCK = threading.Lock()
 
 
+# Phone masking is a separate switch from secret redaction: phone numbers are contact data, not
+# credentials, and business workflows (dispatch, SMS, CRM matching) need the complete number in tool
+# output. ``security.redact_phones: false`` (or HERMES_REDACT_PHONES=false) turns it off. It applies even
+# on ``force=True`` paths because ``force`` guards secrets, not contact data.
+_REDACT_PHONES = os.getenv("HERMES_REDACT_PHONES", "true").lower() in {"1", "true", "yes", "on"}
+_REDACT_PHONES_BY_HOME: dict = {}
+
+
+def _redact_phones_enabled() -> bool:
+    """Effective phone-masking switch for the active profile (launch snapshot when no override)."""
+    from hermes_constants import get_hermes_home_override, hermes_home_key
+    if get_hermes_home_override() is None:
+        return _REDACT_PHONES
+    home_key = hermes_home_key()
+    cached = _REDACT_PHONES_BY_HOME.get(home_key)
+    if cached is not None:
+        return cached
+    enabled = True
+    try:
+        from agent.secret_scope import current_secret_scope
+        scope = current_secret_scope()
+        raw = scope.get("HERMES_REDACT_PHONES") if scope else None
+        if raw is None and scope is None:
+            from hermes_cli.config import load_env
+            raw = load_env().get("HERMES_REDACT_PHONES")
+        if raw is None:
+            from hermes_cli.config import load_config_readonly
+            cfg_val = (load_config_readonly().get("security") or {}).get("redact_phones")
+            raw = None if cfg_val is None else str(cfg_val)
+        if raw is not None:
+            enabled = str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        enabled = True  # unreadable policy: keep the upstream default
+    with _REDACT_ENABLED_LOCK:
+        _REDACT_PHONES_BY_HOME[home_key] = enabled
+    return enabled
+
+
 def _redact_enabled() -> bool:
     """Effective redaction switch for the active profile (launch snapshot when no override)."""
     from hermes_constants import get_hermes_home_override, hermes_home_key
@@ -996,7 +1034,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if "&" in text and "=" in text:
         text = _redact_form_body(text)
 
-    if "+" in text:
+    if "+" in text and _redact_phones_enabled():
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text

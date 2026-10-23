@@ -127,7 +127,7 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # Local ACP subprocess selection (executable/argv authority).
     "HERMES_COPILOT_ACP_COMMAND", "HERMES_COPILOT_ACP_ARGS",
     # Security policy / approval-routing context — set via their dedicated controls only.
-    "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS",
+    "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS", "HERMES_REDACT_PHONES",
     "HERMES_INTERACTIVE", "HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM"})
