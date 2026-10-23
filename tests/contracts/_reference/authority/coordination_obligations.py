@@ -89,6 +89,18 @@ class ObligationLedger:
             "created_at": now, "updated_at": now, "owner_pid": None, "owner_started_at": None,
             "last_error": None, "adapter_profile": _profile(adapter_profile)}
 
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, owner: OwnerStamp) -> bool:
+        now = time.time()
+        rows = self._obligations()
+        if obligation_id in rows or any(row["session_key"] == session_key and row["content"] == content and row["created_at"] >= since for row in rows.values()):
+            return False
+        rows[obligation_id] = {
+            "obligation_id": obligation_id, "session_key": session_key, "platform": platform, "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id else None, "content": content, "state": "attempting", "attempts": 1,
+            "created_at": now, "updated_at": now, "owner_pid": owner.pid, "owner_started_at": owner.started_at,
+            "last_error": None, "adapter_profile": _profile(adapter_profile)}
+        return True
+
     def _update_state(self, obligation_id: str, state: str, error: str = "") -> None:
         row = self._obligations().get(obligation_id)
         if row is not None:

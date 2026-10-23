@@ -258,6 +258,22 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
             thread_id=thread_id, content=content, since=since, adapter_profile=adapter_profile)
 
 
+def record_recovered_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                           thread_id: Optional[str], content: str, since: float,
+                           adapter_profile: Optional[str] = None) -> bool:
+    """Ledger the saved answer of a person's turn lost across a restart (session restart recovery),
+    owned by THIS process and 'attempting' (a streamed part may be on screen: it goes out once, with
+    the recovered marker). True when inserted: the caller sends it. False when this id or the same
+    reply for this conversation since *since* is already ledgered (in any state): that row, and the
+    sweeps that own it, deliver it; a row is never re-owned, so a sweep mid-send is never doubled."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _store() as store:
+        return store.coordination.record_recovered_reply(
+            obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, content=content, since=since, adapter_profile=adapter_profile,
+            owner=OwnerStamp(pid=pid, started_at=started))
+
+
 def mark_attempting(obligation_id: str) -> None:
     with _DB_LOCK, _store() as store:
         store.coordination.mark_obligation_attempting(obligation_id=obligation_id)

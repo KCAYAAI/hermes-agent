@@ -6,7 +6,10 @@ import json
 import sqlite3
 from typing import Any, Mapping, Sequence
 
-from persistence.authority.admissions import AdmissionRecord, AdmissionResult
+from persistence.authority.admissions import (
+    RECOVERY_ATTEMPTS_PREFIX, RECOVERY_OWED_PREFIX, AdmissionRecord, AdmissionResult, LostTurnRow, LostTurnTranscript,
+)
+from persistence.core.conventions import RowVisibility
 from persistence.core.canonical import canonical_json
 from persistence.core.errors import AuthorityRefusal, PermanentStoreError
 from session_rules.api_payloads import compacted_api_payload
@@ -105,6 +108,56 @@ class AdmissionReadsMixin:
 
     def list_unknown(self) -> list[AdmissionRecord]:
         return [rows.record(r) for r in rows.rows_by_seq(self._committed()) if r["status"] == "unknown"]
+
+    def lost_turn_transcript(self, *, session_id: str, event_id: str | None, since: float | None,
+                             admission_id: str | None = None) -> LostTurnTranscript:
+        authority, tables = self._committed(), self._tables()
+        sessions = tables.get("sessions", {})
+        chain: list[str] = []
+        for start in (session_id, rows.physical_target(self._backend, authority, tables, session_id)):
+            if start not in sessions:
+                raise AuthorityRefusal("not_found")
+            walk = [start]
+            for _ in range(100):
+                child = self._backend.lineage._chain_step(self._backend.scope, sessions, walk[-1])
+                if child is None:
+                    break
+                if child in walk:
+                    raise AuthorityRefusal("admission_conflict")
+                walk.append(child)
+            else:
+                raise AuthorityRefusal("admission_conflict")
+            chain += [sid for sid in walk if sid not in chain]
+        transcripts = tables.get("messages", {}).get("transcripts", {})
+        stored = sorted((row for sid in chain if sid in transcripts for row in transcripts[sid].rows), key=lambda row: row.id)
+        anchor = None
+        if event_id:
+            anchor = next((row for row in reversed(stored) if row.message.role == "user" and row.message.platform_message_id == event_id), None)
+        if anchor is None:
+            claim = authority["admissions"].get(admission_id) if admission_id else None
+            after = claim.get("transcript_mark") if claim is not None else None
+            after = -1 if after is None else after
+            ran = since is not None and any(row.message.role in ("assistant", "tool") and row.epoch >= since and row.id > after
+                                            for row in stored)
+            return LostTurnTranscript(anchored=False, anchor_timestamp=None, ran_since=ran, rows=())
+        return LostTurnTranscript(anchored=True, anchor_timestamp=anchor.epoch, ran_since=False, rows=tuple(
+            LostTurnRow(role=row.message.role, content=row.message.content,
+                        tool_calls=json.dumps(list(row.message.tool_calls)) if row.message.tool_calls else None,
+                        tool_call_id=row.message.tool_call_id, display_kind=row.message.display_kind, timestamp=row.epoch,
+                        active=row.visibility == RowVisibility.ACTIVE, finish_reason=row.message.finish_reason)
+            for row in stored if row.id > anchor.id))
+
+    def recovery_attempts(self, *, admission_id: str) -> int:
+        found = self._committed()["meta"].get(RECOVERY_ATTEMPTS_PREFIX + admission_id)
+        try:
+            return int(found) if found is not None else 0
+        except (TypeError, ValueError):
+            return 1_000
+
+    def owed_recovery_answers(self) -> list[tuple[str, str]]:
+        meta = self._committed()["meta"]
+        return sorted((key[len(RECOVERY_OWED_PREFIX):], value) for key, value in meta.items()
+                      if isinstance(key, str) and key.startswith(RECOVERY_OWED_PREFIX))
 
     def has_pending(self, *, session_ids: Sequence[str] = (), statuses: frozenset[str] | None = None) -> bool:
         targets = set(session_ids)
