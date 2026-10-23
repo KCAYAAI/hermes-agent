@@ -178,6 +178,21 @@ class SessionLifecycleMixin:
             self._save()
             return True
 
+    def _update_entry_metadata(self, session_key: str, mutate) -> bool:
+        """``_update_entry`` with the store lock released before the write (KC): apply
+        ``mutate(entry)`` under ``_lock``, then persist the same full snapshot (state.db and the
+        sessions.json mirror) through ``_save_entries``, which re-takes ``_lock`` only to
+        serialize. ``_update_entry`` holds ``_lock`` across the whole state.db write; with
+        thousands of routes and a contended database every turn end queued behind it, and the
+        event loop (which takes ``_lock`` for route lookups) stalled with them. For changes that
+        leave the key -> session_id mapping alone."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or mutate(entry) is False:
+                return False
+        self._save_entries()
+        return True
+
     def _update_all_entries_locked(self, mutate) -> int:
         """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
         returned True. Returns the count that did."""
