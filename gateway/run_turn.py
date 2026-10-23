@@ -2038,6 +2038,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _loop_snapshot = asyncio.get_running_loop()
 
         def _cleanup_temp_bubbles() -> None:
+            # The adapter fires post-delivery callbacks on every outcome. A final reply that was
+            # NOT delivered keeps the bubbles/card as the breadcrumb (None = unknown lane: as before).
+            _outcome = getattr(_cleanup_adapter, "last_delivery_complete", None)
+            if callable(_outcome) and _outcome(session_key, generation=turn_ctx.run_generation) is False:
+                logger.info("Keeping progress card/bubbles: the final reply was not delivered (session=%s)",
+                            session_key)
+                return
+
             async def _delete_all() -> None:
                 for _mid in _ids_snapshot:
                     with suppress(Exception):
