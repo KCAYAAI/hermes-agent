@@ -861,6 +861,35 @@ class TestSlackCuratedModelPicker:
         cb.assert_not_called()
         assert not adapter._model_picker_state
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("curated", [True, False])
+    async def test_only_the_person_who_opened_the_picker_can_use_it(self, curated):
+        """The commit callback carries the opener's identity and scope (e.g. an admin's
+        `/model --global`). Another allowed user's click must not reach it."""
+        adapter = _make_curated_adapter() if curated else _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        client.chat_update = AsyncMock()
+        cb = AsyncMock(return_value="✅ switched")
+        await adapter.send_model_picker(
+            chat_id="C1", providers=_PROVIDERS, current_model="old", current_provider="openrouter",
+            session_key="s1", on_model_selected=cb,
+            metadata={"slack_team_id": "T1", "user_id": "U_NATHAN"})
+        action = ({"action_id": "hermes_model_model", "selected_option": {"value": "0"}} if curated
+                  else {"action_id": "hermes_model_provider", "selected_option": {"value": "0"}})
+
+        await adapter._handle_model_picker_action(AsyncMock(), _interaction_body(uid="U_ALICE"), action)
+        cb.assert_not_called()
+        client.chat_update.assert_not_called()
+        assert adapter._model_picker_state  # still live for its owner
+
+        await adapter._handle_model_picker_action(AsyncMock(), _interaction_body(uid="U_NATHAN"), action)
+        if curated:
+            cb.assert_awaited_once()
+        else:
+            client.chat_update.assert_called_once()  # owner advanced to the model stage
+
     def test_root_slack_block_bridges_model_picker_into_extra(self):
         from gateway.config_loader import bridge_platform_shared_keys
         yaml_cfg = {"slack": {"model_picker": _CURATED}}
