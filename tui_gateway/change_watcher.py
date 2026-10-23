@@ -458,7 +458,9 @@ def _skills_sig():
 _CHANGE_WATCHES: dict[str, tuple[float, Any, Any] | tuple[float, Any, Any, Any]] = {
     "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
     "cron.changed": (1.0, lambda: _home_mtime_ns("cron", "jobs.json"), dict),
-    "sessions.changed": (0.5, _sessions_sig, dict),
+    # 2.0 s, not 0.5 s: the sessions broadcast floor is already 2.0 s, so clients see the same
+    # cadence while each served store is probed a quarter as often under constant Slack writes.
+    "sessions.changed": (2.0, _sessions_sig, dict),
     # Projects created/switched by CLI or agent tooling write projects.db without any
     # state.db movement, so sessions.changed never fires and the desktop Projects
     # sidebar goes stale until a manual refresh (#56757).
@@ -508,6 +510,16 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
             _broadcast_global_event(event, diff_fn[0](before, sig) if diff_fn else payload_fn())
 
 
+def _watch_has_listener() -> bool:
+    """True while a Desktop/TUI client could receive a watched-change broadcast.
+
+    With no transport and no stdio RPC channel, ``_broadcast_global_event`` drops every frame,
+    so computing signatures (state.db reads for every served profile) is pure cost on the shared
+    gateway process. Signatures are kept, not reset: a change made while nobody listened still
+    fires once when the next client attaches."""
+    return bool(_live_transports) or bool(_stdio_is_rpc_channel)
+
+
 _skin_watcher_started = False
 
 
@@ -524,8 +536,11 @@ def _ensure_skin_watcher() -> None:
         while True:
             time.sleep(0.5)
             _broadcast_skin_if_changed()
-            _broadcast_watched_changes()
+            if _watch_has_listener():
+                _broadcast_watched_changes()
             # A failed wake must never end this thread: every push (skin, sessions, groups...) runs on it.
+            # Outside the listener gate: it reads only the store signatures the groups watch cached, so with
+            # no client attached it finds nothing new and room drivers keep their own idle poll.
             with contextlib.suppress(Exception):  # health: allow BLE001 -- the driver's own idle poll still runs
                 _wake_room_drivers()
     threading.Thread(target=_loop, name="hermes-change-watcher", daemon=True).start()
