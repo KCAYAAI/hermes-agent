@@ -42,6 +42,36 @@ def _present(**kwargs) -> dict:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _resolve_sse_event_cap(server_name: str, config: dict) -> int:
+    """Per-event SSE byte cap for *config*: ``max_sse_event_bytes`` when a positive int, else the
+    Hermes wire cap (``_MCP_HTTP_MAX_BODY_BYTES``, 10 MiB) so the SDK never rejects an event the
+    Hermes transport would accept."""
+    from tools.mcp_tool_errors import _MCP_HTTP_MAX_BODY_BYTES
+    raw = config.get("max_sse_event_bytes")
+    if raw is None:
+        return _MCP_HTTP_MAX_BODY_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0 or isinstance(raw, bool):
+        logger.warning("MCP server '%s': ignoring invalid max_sse_event_bytes=%r; using %d",
+                       server_name, raw, _MCP_HTTP_MAX_BODY_BYTES)
+        return _MCP_HTTP_MAX_BODY_BYTES
+    return value
+
+
+def _sdk_sse_event_cap_kwargs(cap: int) -> dict:
+    """``{"max_sse_event_size": cap}`` when the installed SDK's ``streamable_http_client`` accepts it
+    (mcp >= 2.0), else ``{}`` so older SDKs keep working unchanged."""
+    import inspect
+    try:
+        params = inspect.signature(_core.streamable_http_client).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"max_sse_event_size": cap} if "max_sse_event_size" in params else {}
+
+
 def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name: str = "") -> Optional[dict]:
     """Proxy transports for the caller-owned MCP HTTP client, or ``None`` for a direct connect.
 
@@ -579,17 +609,27 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
+        # A per-server max_sse_event_bytes above the default wire cap raises the Hermes cap with it.
+        from tools.mcp_tool_errors import _MCP_HTTP_MAX_BODY_BYTES
+        wire_cap = max(_MCP_HTTP_MAX_BODY_BYTES, getattr(self, "_sse_event_cap", _MCP_HTTP_MAX_BODY_BYTES))
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
-                               "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
+                               "transport": _make_mcp_body_cap_transport(httpx, inner_transport, wire_cap),
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
+
+        # mcp >= 2.0 also caps each SSE event at 1 MiB inside the SDK. Hermes already enforces its own
+        # per-event wire cap (_make_mcp_body_cap_transport), so align the SDK cap with it instead of
+        # failing large-but-legitimate catalogs (e.g. Higgsfield's tools/list). Per-server override:
+        # ``max_sse_event_bytes`` in the server's config.
+        sse_kwargs = _sdk_sse_event_cap_kwargs(
+            getattr(self, "_sse_event_cap", None) or _resolve_sse_event_cap(self.name, {}))
 
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided
             async with _build_client(**client_kwargs) as http_client:
-                async with _core.streamable_http_client(url, http_client=http_client) as streams:
+                async with _core.streamable_http_client(url, http_client=http_client, **sse_kwargs) as streams:
                     yield streams
         return _owned_client_streams()
 
@@ -609,6 +649,7 @@ class MCPServerTransportMixin:
         url, headers = inputs
         logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
+        self._sse_event_cap = _resolve_sse_event_cap(self.name, config)
         # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
         # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
