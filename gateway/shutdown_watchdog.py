@@ -250,6 +250,20 @@ def resolve_shutdown_watchdog_delay(
     return _coerce_float(drain_timeout, 0.0) + grace
 
 
+def _main_thread_stack() -> str:
+    """The main (event-loop) thread's stack as text; never raises."""
+    try:
+        import traceback
+        ident = threading.main_thread().ident
+        frame = sys._current_frames().get(ident) if ident is not None else None
+        if frame is None:
+            return "--- main thread: no frame ---\n"
+        return ("--- main thread (event loop) ---\n" + "".join(traceback.format_stack(frame))
+                + "--- end main thread ---\n")
+    except Exception as exc:  # diagnostics only
+        return f"--- main thread: stack unavailable ({type(exc).__name__}) ---\n"
+
+
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[dict[str, Any]],
                          event: str = "shutdown_watchdog_fired",
                          loop_thread_id: Optional[int] = None) -> None:
@@ -269,7 +283,7 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
     with contextlib.suppress(OSError):  # unwritable dir: skip only the file copy, stderr still runs
         dump_path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(Exception), open(dump_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(header, default=str) + "\n" + loop_section)
+        fh.write(json.dumps(header, default=str) + "\n" + (loop_section or _main_thread_stack()))
         fh.flush()
         fh.write("--- faulthandler dump (all threads) ---\n")
         fh.flush()
@@ -283,7 +297,8 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
         # The loop section goes to stderr as well: with the disk wedged, journald/launchd keep only
         # this copy, and its faulthandler dump is capped at 100 threads, newest first.
         sys.stderr.write(f"Gateway {event.replace('_', ' ')} after {delay_s:.0f}s "
-                         f"(pid={os.getpid()}); dumping all thread stacks.\n" + loop_section)
+                         f"(pid={os.getpid()}); dumping all thread stacks.\n"
+                         + (loop_section or _main_thread_stack()))
         sys.stderr.flush()
         faulthandler.dump_traceback(all_threads=True)
 
