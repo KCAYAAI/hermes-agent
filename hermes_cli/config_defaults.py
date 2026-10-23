@@ -1719,6 +1719,10 @@ DEFAULT_CONFIG = {
         "fake_ip_ranges": [],
         "redact_secrets": True,
         "redact_phone_numbers": True,  # false: E.164 numbers shown in replies/chat only, never other secrets
+        # Mask E.164 phone numbers (+15551234567 -> +155****4567) in tool output. Separate from
+        # redact_secrets: phone numbers are contact data that dispatch/SMS/CRM workflows need whole.
+        # Also applies to final replies sent to chat platforms (they pass the same redactor).
+        "redact_phones": True,
         # Ack for unattended model overrides on a vendor-trains-on-prompts tier (startup still warns).
         "allow_data_training_tiers_noninteractive": False,
         # Human-approval presentation transport. "builtin" = CLI/TUI/gateway/ACP surfaces; a plugin
