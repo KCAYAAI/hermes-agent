@@ -2094,6 +2094,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 chat_id=str(source.chat_id),
                 message_ids={str(m) for m in (turn_ctx.event_message_id, turn_ctx.inbound_message_id) if m},
                 profile=getattr(source, "profile", None),
+                team_id=str(getattr(source, "scope_id", "") or ""),
             )
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
