@@ -135,12 +135,56 @@ def resolve_profile_policy(home) -> None:
     try:
         key = hermes_home_key()
         from hermes_cli.config import load_config_readonly, load_env
-        note_env_policy(key, load_env().get("HERMES_REDACT_SECRETS"))
-        note_config_policy(key, (load_config_readonly().get("security") or {}).get("redact_secrets"))
+        env = load_env()
+        cfg_security = load_config_readonly().get("security") or {}
+        note_env_policy(key, env.get("HERMES_REDACT_SECRETS"))
+        note_config_policy(key, cfg_security.get("redact_secrets"))
+        note_env_phones_policy(key, env.get("HERMES_REDACT_PHONES"))
+        note_config_phones_policy(key, cfg_security.get("redact_phones"))
     except (Exception, SystemExit) as exc:  # health: allow BLE001 -- unreadable now: stays unknown, which redacts
         logging.getLogger(__name__).debug("redaction policy for %s not read: %s", home, exc)
     finally:
         reset_hermes_home_override(token)
+
+
+# Phone masking is a separate switch from secret redaction: phone numbers are contact data, not
+# credentials, and business workflows (dispatch, SMS, CRM matching) need the complete number in tool
+# output. ``security.redact_phones: false`` (or HERMES_REDACT_PHONES=false) turns it off. It applies even
+# on ``force=True`` paths because ``force`` guards secrets, not contact data.
+_REDACT_PHONES = os.getenv("HERMES_REDACT_PHONES", "true").lower() in {"1", "true", "yes", "on"}
+# Routed multiplex profiles record their phone policy the same way as the secret policy above: when
+# that profile's .env / config is loaded or its log routing is set up. The formatter never reads config.
+_ENV_PHONES_BY_HOME: dict = {}     # home key -> raw HERMES_REDACT_PHONES from its .env, or None
+_CONFIG_PHONES_BY_HOME: dict = {}  # home key -> raw security.redact_phones from its config, or None
+
+
+def note_env_phones_policy(home_key: str, raw) -> None:
+    _ENV_PHONES_BY_HOME[home_key] = None if raw is None else str(raw)
+
+
+def note_config_phones_policy(home_key: str, raw) -> None:
+    _CONFIG_PHONES_BY_HOME[home_key] = None if raw is None else str(raw)
+
+
+def _redact_phones_enabled() -> bool:
+    """Effective phone-masking switch for the active profile (launch snapshot when no override). Reads
+    only in-memory state, like ``_redact_enabled``. Unknown policy masks (the upstream default)."""
+    from hermes_constants import get_hermes_home_override, hermes_home_key
+    if get_hermes_home_override() is None:
+        return _REDACT_PHONES
+    home_key = hermes_home_key()
+    from agent.secret_scope import current_secret_scope
+    scope = current_secret_scope()
+    raw = scope.get("HERMES_REDACT_PHONES") if scope else None
+    if raw is None and scope is None:
+        if home_key not in _ENV_PHONES_BY_HOME:
+            return True
+        raw = _ENV_PHONES_BY_HOME[home_key]
+    if raw is None:
+        raw = _CONFIG_PHONES_BY_HOME.get(home_key)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _redact_enabled() -> bool:
@@ -1629,7 +1673,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if "&" in text and "=" in text:
         text = _redact_form_body(text)
 
-    if "+" in text:
+    if "+" in text and _redact_phones_enabled():
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
