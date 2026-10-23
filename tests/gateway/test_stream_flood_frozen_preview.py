@@ -18,6 +18,14 @@ from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from tests.waiting import async_wait_until
 
 
+@pytest.fixture(autouse=True)
+def _upstream_mode(monkeypatch):
+    """KC turns this path off (one bounded edit, no in-place finish); test upstream's mode."""
+    import gateway.run_turn_final_reconcile as rec
+    monkeypatch.setattr(rec, "_STREAMED_EDIT_TIMEOUT_S", None)
+    monkeypatch.setattr(rec, "KC_FINISH_UNCONFIRMED_PREVIEW_IN_PLACE", True)
+
+
 class _Harness(GatewayTurnMixin):
     """Only the delivery decision under test; the real consumer and predicate run."""
 
