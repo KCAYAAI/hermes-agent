@@ -655,6 +655,11 @@ class SessionAuthority:
         from collections import Counter
         from gateway.session_envelope import check_native_route
         bindings = list(bindings)
+        if getattr(self, '_owed_answers_task', None) is None:
+            # Saved answers a previous process committed but never handed to the delivery ledger.
+            from gateway.session_restart_recovery import deliver_owed_answers
+            self._owed_answers_task = asyncio.create_task(deliver_owed_answers(self))
+            self._owed_answers_task.add_done_callback(_log_drain_failure)
         counts = Counter(sid for sid, _, _ in bindings)
         results = {}
         for sid, available_source, adapter in bindings:
@@ -684,7 +689,14 @@ class SessionAuthority:
                 self._require_admission_open()
                 self.sessions.setdefault(sid, LiveSession(source, route))
                 if any(row['status'] == 'unknown' for row in rows):
-                    raise RuntimeStoreError('unknown_execution')
+                    # A person's lost messaging turn is recovered by its drain from the saved
+                    # transcript (gateway/session_restart_recovery.py); anything else stays paused.
+                    from gateway.session_restart_recovery import has_recoverable_person
+                    if not has_recoverable_person(rows):
+                        raise RuntimeStoreError('unknown_execution')
+                    self._schedule(SessionRef(self.profile_id, sid))
+                    results[sid] = 'recovering'
+                    continue
                 self._schedule(SessionRef(self.profile_id, sid))
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
@@ -1229,6 +1241,24 @@ class SessionAuthority:
                         # person's lost turn keeps the FIFO paused for them to resolve.
                         from gateway.session_unattended_unknown import settle_unattended_unknown
                         if await settle_unattended_unknown(self, ref):
+                            continue
+                        # A person's lost messaging turn: settle a saved answer, rerun a turn that did
+                        # nothing irreversible, or let their next message continue it (no /discard).
+                        from gateway.session_restart_recovery import recover_person_unknown
+                        from gateway.session_restart_recovery import DEFERRED
+                        live.rescan = False  # input admitted while recovery reads must not be stranded
+                        recovered = await recover_person_unknown(self, ref)
+                        if recovered == DEFERRED:  # transient storage: back off like a claim, stop on drain
+                            if self._drain_stopping(ref, live):
+                                return None
+                            backoff = min(max(backoff * 2, _CLAIM_RETRY_MIN_S), _CLAIM_RETRY_MAX_S)
+                            await asyncio.sleep(backoff)
+                            continue
+                        if recovered:
+                            continue
+                        if live.rescan:  # a person spoke meanwhile: their message may continue the lost turn
+                            if self._drain_stopping(ref, live):
+                                return None
                             continue
                     if exc.reason == 'admission_conflict':
                         # A verdict on the head alone (its route or binding moved under it) that every drain
