@@ -2,6 +2,7 @@
 """Slack platform adapter: slack-bolt Socket Mode (messages, slash commands, threads)."""
 
 import asyncio
+import contextlib
 import contextvars
 import functools
 import inspect
@@ -156,7 +157,7 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(r"<!(?:everyone|channel|here)(?:\|[^>\n]*
 
 # Thread-root images delivered on a mid-thread cold start; other messages' files
 # are text markers only (the root is usually the artifact the mention is about).
-_THREAD_ROOT_IMAGE_MAX = 4
+_THREAD_ROOT_IMAGE_MAX = 4  # images and documents combined
 
 
 def _slack_file_marker(file_obj: dict[str, Any]) -> str:
@@ -304,6 +305,23 @@ def _session_status_method(client: Any):
         if method is not None:
             return method
     return client.assistant_threads_setStatus
+
+
+def _uses_agent_sessions(client: Any) -> bool:
+    """True when status writes go to ``agents.sessions.setStatus`` (lifecycle enum only)."""
+    return _sdk_supports_agent_sessions() and getattr(client, "agents_sessions_setStatus", None) is not None
+
+
+def _agent_session_status(status: str) -> str:
+    """Map a legacy status line to an Agent Sessions lifecycle value. ``agents.sessions.setStatus``
+    accepts only ``active|processing|suspended|closed``; free text is rejected. Any non-empty
+    working text means ``processing``; an empty clear means ``active`` (idle, reusable)."""
+    return status if status in _AGENT_SESSION_STATES else ("processing" if status else "active")
+
+
+_AGENT_SESSION_STATES = frozenset({"active", "processing", "suspended", "closed"})
+# Re-send an unchanged lifecycle value at most this often (Slack may reset it on posts).
+_AGENT_STATUS_REFRESH_S = 60.0
 
 
 def _session_title_method(client: Any):
@@ -1093,6 +1111,9 @@ class SlackAdapter(BasePlatformAdapter):
         # long retry loops used to spam threads with dozens of out-of-order status messages.
         self._status_message_ids: dict[tuple[str, str, str], str] = {}
         self._thread_context_cache: dict[str, _ThreadContextCache] = {}
+        # Last Agent Sessions lifecycle value written per (team, channel, thread).
+        self._agent_session_states: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self._status_loop: Optional[asyncio.AbstractEventLoop] = None
         # Threads already rehydration-checked this process (first reply after a restart injects
         # missed messages exactly once); message IDs with reaction lifecycle (bounded: an exception
         # between add and finalize would leak entries).
@@ -2417,15 +2438,32 @@ class SlackAdapter(BasePlatformAdapter):
             # An HTTP 200 + ``ok=false`` reply raises too; its ``str()`` reads like a transport
             # failure ("status: 200") while the real cause is the body's error code.
             api_error = _slack_response_payload(getattr(e, "response", None)).get("error")
+            if api_error == "message_not_found":
+                # Expected after progress cleanup or a user deletion; callers post fresh.
+                self._forget_status_message(chat_id, message_id)
+                logger.info(
+                    "[Slack] Message %s in channel %s no longer exists "
+                    "(api_error=message_not_found); sending fresh instead",
+                    message_id, chat_id)
+                return SendResult(success=False, error=str(e))
             logger.error(
                 "[Slack] Failed to edit message %s in channel %s: api_error=%s: %s",
                 message_id, chat_id, api_error or "none", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    def _forget_status_message(self, chat_id: str, message_id: str) -> None:
+        """Drop cached status-bubble ids that point at a message that no longer exists, so the next
+        send_or_update_status posts fresh instead of editing a deleted message."""
+        for key, cached in list(self._status_message_ids.items()):
+            if cached == str(message_id) and key[0] == str(chat_id):
+                self._status_message_ids.pop(key, None)
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot message (used to clean up temporary progress bubbles)."""
         if not self._app:
             return False
+        # Whatever the outcome, a deleted (or undeletable) bubble must not be edited next turn.
+        self._forget_status_message(chat_id, message_id)
         try:
             response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
             if not (hasattr(response, "get") and response.get("ok") is False):
@@ -2713,6 +2751,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
         if not self._app:
             return
+        self._status_loop = asyncio.get_running_loop()
         thread_ts = None
         if metadata:
             # Same synthetic-thread guard as sending: with reply_in_thread=false thread_id is the
@@ -2751,12 +2790,57 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
+        """Thread status write (empty ``status`` clears). Agent Sessions receives lifecycle values
+        only and repeats of the same value are skipped; the legacy Assistant API receives the
+        text line. Failures are debug-logged."""
         try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
-            await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            client = self._get_client(chat_id, team_id=team_id)
+            if _uses_agent_sessions(client):
+                status = _agent_session_status(status)
+                key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
+                last = self._agent_session_states.get(key) if key else None
+                if last and last[0] == status and time.monotonic() - last[1] < _AGENT_STATUS_REFRESH_S:
+                    return
+                await client.agents_sessions_setStatus(
+                    channel_id=chat_id, thread_ts=thread_ts, status=status)
+                if key:
+                    self._agent_session_states[key] = (status, time.monotonic())
+                    self._evict_oldest_by_ts(
+                        self._agent_session_states, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
+                return
+            await client.assistant_threads_setStatus(
+                channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
+            logger.debug("[Slack] thread status %s: %s", fail_label, e)
+
+    def pause_typing_for_chat(self, chat_id: str) -> None:
+        """Pause the working refresh while waiting on the user (clarify/approval); tracked threads
+        in this chat show Agent Sessions ``suspended`` until work resumes."""
+        super().pause_typing_for_chat(chat_id)
+        self._schedule_status_for_chat(chat_id, "suspended")
+
+    def resume_typing_for_chat(self, chat_id: str) -> None:
+        """Resume the refresh; tracked threads go back to ``processing`` immediately."""
+        super().resume_typing_for_chat(chat_id)
+        self._schedule_status_for_chat(chat_id, "processing")
+
+    def _schedule_status_for_chat(self, chat_id: str, status: str) -> None:
+        """Thread-safe lifecycle write for every tracked status thread of ``chat_id``. Called from
+        the agent thread, so it hops onto the adapter loop; a no-op without Agent Sessions."""
+        loop = getattr(self, "_status_loop", None)
+        if not self._app or loop is None or loop.is_closed():
+            return
+        targets = [
+            (key, entry) for key, entry in list(getattr(self, "_active_status_threads", {}).items())
+            if isinstance(key, tuple) and len(key) == 3 and key[1] == str(chat_id)
+            and isinstance(entry, dict)]
+        for _key, entry in targets:
+            team_id, thread_ts = entry.get("team_id", ""), entry.get("thread_ts", "")
+            if not thread_ts or not _uses_agent_sessions(self._get_client(chat_id, team_id=team_id)):
+                continue
+            with contextlib.suppress(RuntimeError):
+                asyncio.run_coroutine_threadsafe(
+                    self._set_thread_status(chat_id, team_id, thread_ts, status, status), loop)
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -4082,7 +4166,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _should_wake_on_unmentioned_message(
         self, event_thread_ts, channel_id: str, user_id: str, is_thread_reply: bool,
-        team_id: str = "", chat_type: str = "group") -> bool:
+        team_id: str = "", chat_type: str = "group", remember: bool = False) -> bool:
         """Return True if the bot should wake on an un-mentioned message. Checks, in order: root
         sent via send() (_bot_message_ts); thread previously @-mentioned; active session;
         bot-authored root via raw chat.postMessage; thread parent @-mentioned the bot.
@@ -4121,7 +4205,7 @@ class SlackAdapter(BasePlatformAdapter):
                     strip_bot_mention=False)
                 if parent_text and f"<@{bot_uid}>" in parent_text:
                     # Remember so later replies skip the fetch.
-                    if not self._slack_strict_mention():
+                    if remember or not self._slack_strict_mention():
                         self._register_mentioned_thread(event_thread_ts)
                     return True
         return False
@@ -4191,6 +4275,20 @@ class SlackAdapter(BasePlatformAdapter):
         thread_gated = self._slack_thread_require_mention() and is_thread_reply and not is_mentioned
         if force_process:
             return True
+        if is_thread_reply and not is_mentioned and event_thread_ts:
+            chat_type = "dm" if is_dm else "group"
+            # A typed answer to this thread's pending clarify is addressed to the bot.
+            if self._thread_has_pending_clarify(
+                    channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id,
+                    team_id=team_id, chat_type=chat_type, text=routing_text):
+                return True
+            # natural_thread_channels: one top-level @mention engages the thread; later
+            # replies need no mention even under strict_mention / thread_require_mention.
+            if channel_id in self._slack_natural_thread_channels():
+                return await self._should_wake_on_unmentioned_message(
+                    event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
+                    team_id=team_id, is_thread_reply=is_thread_reply, chat_type=chat_type,
+                    remember=True)
         free_channel = self._slack_is_free_channel(channel_id)
         if not free_channel and self._slack_strict_mention() and not is_mentioned:
             return False  # Strict mode: ignore until @-mentioned again
@@ -4537,7 +4635,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _apply_bot_mention(
         self, text: str, original_text: str, command_probe_text: str, is_command_text: bool,
-        bot_uid: str, thread_ts: Optional[str], team_id: str) -> tuple[str, str, str, bool]:
+        bot_uid: str, thread_ts: Optional[str], team_id: str, channel_id: str = "",
+    ) -> tuple[str, str, str, bool]:
         """Strip our mention, re-probe for a command hidden behind it, remember the thread.
         Returns updated ``(text, original_text, command_probe_text, is_command_text)``."""
         text = text.replace(f"<@{bot_uid}>", "").strip()
@@ -4554,9 +4653,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Remember the thread so follow-ups auto-trigger (skipped under strict_mention /
         # thread_require_mention, which it would defeat). Session-scoped ``thread_ts`` because a
         # top-level @mention STARTS a thread whose replies must trigger too.
-        if (
-            thread_ts and not self._slack_strict_mention()
-            and not self._slack_thread_require_mention()):
+        if thread_ts and (
+            channel_id in self._slack_natural_thread_channels()
+            or (not self._slack_strict_mention() and not self._slack_thread_require_mention())):
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
@@ -4643,7 +4742,7 @@ class SlackAdapter(BasePlatformAdapter):
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
-                team_id)
+                team_id, channel_id=channel_id)
         # Thread history stays out of ``text``: prepending would push a command off char zero.
         (
             channel_context, thread_root_media_urls, thread_root_media_types,
@@ -5403,8 +5502,9 @@ class SlackAdapter(BasePlatformAdapter):
         session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Clarify prompt as Block Kit buttons: one ``hermes_clarify_choice_<idx>`` per option
         (value ``clarify_id|idx``) plus "✏️ Other…" (``hermes_clarify_other``), which flips the
-        entry into text-capture mode for the gateway's text-intercept. No choices → base impl."""
-        if not choices:
+        entry into text-capture mode for the gateway's text-intercept. No choices, or
+        ``extra.clarify_buttons: false`` (buttons truncate long options) → base numbered text."""
+        if not choices or not self._extra_flag("clarify_buttons", default=True):
             return await super().send_clarify(
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
@@ -6017,9 +6117,10 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _collect_thread_root_images(
         self, channel_id: str, thread_ts: str, team_id: str = "") -> tuple[list[str], list[str]]:
-        """Thread-root ``image/*`` files → (paths, mimetypes); cold-start only (once per session),
-        read from the cache filled by :meth:`_fetch_thread_context`. Best-effort: text markers
-        already announce the image, so failures never produce an error turn."""
+        """Thread-root images and documents → (paths, mimetypes); cold-start only (once per session),
+        read from the cache filled by :meth:`_fetch_thread_context`. Files are recovered only when
+        the root was posted by a verified human (not a bot, app, or unknown sender). Best-effort:
+        text markers already announce the files, so failures never produce an error turn."""
         media_urls: list[str] = []
         media_types: list[str] = []
         try:
@@ -6027,8 +6128,9 @@ class SlackAdapter(BasePlatformAdapter):
                 self._thread_cache_key(channel_id, thread_ts, team_id))
             root = self._thread_root_message(cached.messages, thread_ts) if cached else None
             files = root.get("files") if root else None
-            if not isinstance(files, list):
+            if not isinstance(files, list) or not files:
                 return media_urls, media_types
+            docs_allowed: Optional[bool] = None  # resolved lazily, only if a document is present
             for f in files:
                 if len(media_urls) >= _THREAD_ROOT_IMAGE_MAX:
                     break
@@ -6041,19 +6143,30 @@ class SlackAdapter(BasePlatformAdapter):
                         continue
                 mimetype = str(f.get("mimetype") or "")
                 url = f.get("url_private_download") or f.get("url_private", "")
-                if not mimetype.startswith("image/") or not url:
+                kind = self._slack_file_kind(f, mimetype) if url else ""
+                if kind not in ("image", "document"):
                     continue
+                if kind == "document":
+                    if docs_allowed is None:
+                        docs_allowed = await self._thread_root_sender_verified(root, channel_id, team_id)
+                        if not docs_allowed:
+                            logger.info(
+                                "[Slack] Thread-root documents not loaded: root sender is not a "
+                                "verified, authorized human (channel=%s thread=%s)", channel_id, thread_ts)
+                    if not docs_allowed:
+                        continue
                 try:
-                    cached_path, media_type, _ = await self._cache_slack_file(
-                        "image", f, url, mimetype, team_id)
-                    media_urls.append(cached_path)
-                    media_types.append(media_type)
+                    cached_file = await self._cache_slack_file(kind, f, url, mimetype, team_id)
+                    if cached_file is None:
+                        continue
+                    media_urls.append(cached_file[0])
+                    media_types.append(cached_file[1])
                 except Exception as exc:
                     logger.warning(
-                        "[Slack] Failed to cache thread-root image %s: %s",
+                        "[Slack] Failed to cache thread-root %s %s: %s", kind,
                         f.get("id") or f.get("name") or "unknown", exc)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("[Slack] Thread-root image recovery failed: %s", exc)
+            logger.debug("[Slack] Thread-root file recovery failed: %s", exc)
         return media_urls, media_types
 
     def _slash_channel_gated(self, channel_id: str) -> bool:
@@ -6074,6 +6187,28 @@ class SlackAdapter(BasePlatformAdapter):
             slash = (command.get("command") or "").lstrip("/")
             await ack(response_type="ephemeral", text=t("platform.slack.slash.running", command=slash))
         await self._handle_slash_command(command)
+
+    async def _thread_root_sender_verified(
+        self, root: Dict[str, Any], channel_id: str, team_id: str) -> bool:
+        """True only for a root posted by an active human Slack user (no bot/app/webhook author)
+        who also passes this profile's sender authorization (excludes outside guests)."""
+        user_id = str(root.get("user") or "")
+        if not user_id or root.get("bot_id") or root.get("subtype") in {"bot_message", "app_message"}:
+            return False
+        try:
+            payload = await self._users_info_payload(user_id, channel_id, team_id)
+        except Exception:
+            return False
+        user = payload.get("user") if isinstance(payload, dict) else None
+        if not isinstance(user, dict) or user.get("id") not in (None, user_id) or user.get("deleted"):
+            return False
+        if self._parse_users_info(payload, user_id)[1]:
+            return False
+        # Only a verified human is enough when no authorization callback exists.
+        # A configured callback must explicitly approve before a private download.
+        if self._authorization_check is None:
+            return True
+        return self._is_sender_authorized(user_id, "group", channel_id) is True
 
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
@@ -6239,6 +6374,35 @@ class SlackAdapter(BasePlatformAdapter):
                 "set_session_metadata", channel_id, thread_ts, user_id, team_id, watermark_ts)
         except Exception:
             logger.debug("[Slack] Failed to persist thread watermark", exc_info=True)
+
+    def _thread_has_pending_clarify(
+        self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "", *,
+        chat_type: str = "group", text: str = "") -> bool:
+        """True when ``text`` from ``user_id`` answers this thread's pending clarify: the replier
+        must be the session's originating user and the text must be a valid answer (a listed
+        choice, or any text for an open-ended prompt). Bystanders in a shared thread session and
+        chatter that is not an answer never bypass the mention gate. Fails closed."""
+        try:
+            session_key = self._build_thread_session_key(
+                channel_id, thread_ts, user_id, team_id=team_id, chat_type=chat_type)
+            if not session_key or not user_id:
+                return False
+            from tools import clarify_gateway
+            entry = clarify_gateway.get_pending_for_session(session_key, include_choice_prompts=True)
+            if entry is None:
+                return False
+            store = getattr(self, "_session_store", None)
+            if store is None:
+                return False
+            store._ensure_loaded()
+            session = store._entries.get(session_key)
+            origin = getattr(session, "origin", None) if session else None
+            if str(getattr(origin, "user_id", "") or "") != str(user_id):
+                return False
+            value, _reason = clarify_gateway._coerce_text_response_detailed(entry, text)
+            return value is not None
+        except Exception:
+            return False
 
     def _has_active_session_for_thread(
         self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "", *,
@@ -6462,6 +6626,9 @@ class SlackAdapter(BasePlatformAdapter):
         "require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS")
     _slack_ignored_channels = _extra_or_env_channel_set_getter(
         "ignored_channels", "SLACK_IGNORED_CHANNELS", coerce_scalar=True)
+    # natural_thread_channels: top-level @mention required; engaged thread replies need none.
+    _slack_natural_thread_channels = _extra_or_env_channel_set_getter(
+        "natural_thread_channels", "SLACK_NATURAL_THREAD_CHANNELS", coerce_scalar=True)
 
     def _slack_mention_patterns(self) -> list[re.Pattern]:
         """Compile (cached) wake-word regexes from ``slack.mention_patterns`` (list/str) or
@@ -6917,6 +7084,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),
     ("allowed_channels", "SLACK_ALLOWED_CHANNELS", "csv"), ("ignored_channels", "SLACK_IGNORED_CHANNELS", "csv"),
+    ("natural_thread_channels", "SLACK_NATURAL_THREAD_CHANNELS", "csv"),
 )
 
 
