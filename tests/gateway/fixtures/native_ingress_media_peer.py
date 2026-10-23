@@ -140,30 +140,40 @@ async def probe(mode, peer):
             assert not peer.requests
         finally:
             retained.write_bytes(original_bytes)
+        first_boot = initial[0]['status'] != 'terminal'
+        # Before the kill, the media check claimed the second row and never ran it.
+        # Restart recovery runs it once in its own place; it never pauses the chat.
         result = await authority.recover_native_sessions([binding, (
             before['unknown_sid'], replace(source, chat_id='unknown-media'), adapter)])
-        assert result[before['unknown_sid']] == 'unknown_execution', result
-        task = authority.sessions[sid].task
-        if task:
-            await asyncio.wait_for(task, 35)
+        assert result[before['unknown_sid']] == ('recovering' if first_boot else 'ready'), result
+        for task_sid in (sid, before['unknown_sid']):
+            task = authority.sessions[task_sid].task
+            if task:
+                await asyncio.wait_for(task, 35)
         after = rows(sid)
         assert after[0]['status'] == 'terminal' and after[0]['outcome'] == 'completed', after
         assert after[0]['payload'] == before['saved']['payload']
-        assert rows(before['unknown_sid'])[0]['status'] == 'unknown'
+        assert rows(before['unknown_sid'])[0]['status'] == 'terminal', rows(before['unknown_sid'])
         for row in [after[0], rows(before['unknown_sid'])[0]]:
             assert Path(restore_native(row['payload']).media_urls[0]).read_text() == 'ORIGINAL_DOCUMENT_BYTES'
-        if initial[0]['status'] != 'terminal':
-            assert len(peer.requests) == 1, peer.requests
-            wire = json.dumps(peer.requests[0]['messages'])
-            # False explicitly means a cached-file reference, not implicit text inlining.
-            assert str(retained) in wire, wire
-            for text in ('MEDIA_RECOVERY_INPUT', 'ORIGINAL_CHANNEL_CONTEXT',
-                         'ORIGINAL_CHANNEL_PROMPT', 'ORIGINAL_QUOTE'):
-                assert text in wire, (text, wire)
-            assert 'MUTATED_' not in wire
-            delivery = next(d for d in adapter.deliveries if 'LOCAL_ACK' in d['content'])
-            assert delivery['chat_id'] == source.chat_id and delivery['reply_to'] == 'media-1', delivery
+        if first_boot:
+            # The saved row and the never-run row: one model call each, both from the original bytes.
+            assert len(peer.requests) == 2, peer.requests
+            for request in peer.requests:
+                wire = json.dumps(request['messages'])
+                # False explicitly means a cached-file reference, not implicit text inlining.
+                assert str(retained) in wire, wire
+                for text in ('MEDIA_RECOVERY_INPUT', 'ORIGINAL_CHANNEL_CONTEXT',
+                             'ORIGINAL_CHANNEL_PROMPT', 'ORIGINAL_QUOTE'):
+                    assert text in wire, (text, wire)
+                assert 'MUTATED_' not in wire
+            delivery = next(d for d in adapter.deliveries if 'LOCAL_ACK' in d['content'] and d['chat_id'] == source.chat_id)
+            assert delivery['reply_to'] == 'media-1', delivery
             assert delivery['metadata']['thread_id'] == 'topic-7', delivery
+            # The rerun row answers in its own chat, threaded to its own message.
+            rerun = [d for d in adapter.deliveries if 'LOCAL_ACK' in d['content'] and d['chat_id'] == 'unknown-media']
+            assert len(rerun) == 1 and rerun[0]['reply_to'] == 'unknown-1', adapter.deliveries
+            assert sum('LOCAL_ACK' in d['content'] for d in adapter.deliveries) == 2, adapter.deliveries
         else:
             assert not peer.requests and not adapter.deliveries
         (state / 'recovered.json').write_text(json.dumps(dict(model_calls=len(peer.requests),
