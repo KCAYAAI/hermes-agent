@@ -145,6 +145,27 @@ class DeliveryObligationVerbs:
         with translated():
             self._obligation_write(_do)
 
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                               thread_id: Optional[str], content: str, since: float,
+                               adapter_profile: Optional[str] = None, owner: OwnerStamp) -> bool:
+        """Ledger the saved answer of a person's turn lost across a restart: ``attempting``, owned by ``owner``, one
+        attempt; True when inserted, False when this id or the same reply since ``since`` is already ledgered."""
+        now, (pid, started) = time.time(), (owner.pid, owner.started_at)
+        def _do(conn):
+            return conn.execute(
+                """INSERT OR IGNORE INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id,
+                    content, state, attempts, created_at, updated_at,
+                    owner_pid, owner_started_at, adapter_profile)
+                   SELECT ?, ?, ?, ?, ?, ?, 'attempting', 1, ?, ?, ?, ?, ?
+                   WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
+                                     WHERE session_key = ? AND content = ? AND created_at >= ?)""",
+                (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                 content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+                 session_key, content, since)).rowcount == 1
+        with translated():
+            return self._obligation_write(_do)
+
     # Sets one row's state and error whatever its owner; the error keeps its first 500 characters.
     def _update_state(self, obligation_id: str, state: str, error: str = "") -> None:
         def _do(conn):
