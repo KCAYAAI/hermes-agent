@@ -61,7 +61,9 @@ def test_native_queue_survives_owner_kill_without_replaying_unknown(tmp_path):
                 child.kill()
                 child.wait(timeout=10)
     env['AUTHORITY_PROBE_MODE'] = 'recover'
-    for expected_calls in (1, 0):
+    # First recovery: the safe queued row plus the lost turn's follower (the lost turn itself is
+    # never replayed). A second boot finds nothing left to run.
+    for expected_calls in (2, 0):
         result = subprocess.run(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=70, check=False)
         assert result.returncode == 0, result.stdout + '\n' + result.stderr
