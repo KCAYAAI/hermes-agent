@@ -472,3 +472,36 @@ async def test_cancelling_the_turn_during_the_sender_wait_starts_no_followup():
     assert events == []
     release.set()
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivered", [False, True])
+async def test_cleanup_keeps_breadcrumbs_when_the_final_reply_was_not_delivered(
+    monkeypatch, tmp_path, delivered
+):
+    """KC review 2026-10-22: the callback fires from the adapter's ``finally`` even when the
+    final send failed; the bubbles must then stay as the breadcrumb."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="sess-1", session_key=session_key)
+    assert result["final_response"] == "done"
+    from gateway.platforms.base import _DELIVERY_OUTCOME
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    token = _DELIVERY_OUTCOME.set((session_key, None, delivered))
+    try:
+        await _fire_post_delivery_cb(cb)
+    finally:
+        _DELIVERY_OUTCOME.reset(token)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+    assert bool(adapter.deleted) is delivered

@@ -57,6 +57,12 @@ def register_bubble_cleanup(response: Any, turn_ctx: TurnContext) -> None:
             return False
 
     async def _cleanup_temp_bubbles() -> None:
+        # The adapter fires post-delivery callbacks on every outcome. A final reply that was NOT
+        # delivered keeps the bubbles/card as the breadcrumb (None = unknown lane: as before).
+        outcome = getattr(adapter, "last_delivery_complete", None)
+        if callable(outcome) and outcome(session_key, generation=turn_ctx.run_generation) is False:
+            logger.info("Keeping progress card/bubbles: the final reply was not delivered (session=%s)", session_key)
+            return
         failed = sum(not ok for ok in await asyncio.gather(*(_delete(mid) for mid in ids_snapshot)))
         if failed:
             logger.info("Temp bubble cleanup for session %s: %d of %d deletes failed",
