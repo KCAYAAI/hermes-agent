@@ -512,6 +512,7 @@ async def deliver_response(adapter, event, session_key, response):
     nothing to send, or at least one send that succeeded)."""
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
     text, ttl = adapter._unwrap_ephemeral(response)
+    event._kc_reply_complete = not text  # KC: nothing to send is complete; a send that raises is not
     if not text:
         return True
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
@@ -522,10 +523,15 @@ async def deliver_response(adapter, event, session_key, response):
                                        metadata, ttl > 0, ttl, results.append)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
                                        record_delivery=results.append)
-    return any(getattr(result, 'success', False) for result in results if result is not None)
+    sent = [result for result in results if result is not None]
+    # KC: the whole reply arrived (every send succeeded, no partial batch), as
+    # ``_process_message_background`` tracks it; read by ``_run_own_post_delivery``.
+    event._kc_reply_complete = all(
+        getattr(result, 'success', False) and getattr(result, 'error_kind', None) != 'partial' for result in sent)
+    return any(getattr(result, 'success', False) for result in sent)
 
 
-async def _run_own_post_delivery(adapter, session_key, event):
+async def _run_own_post_delivery(adapter, session_key, event, *, complete=None):
     """A busy follow-up's observer is its turn's native waiter (``admit_message``), so the drain leaves
     the turn's post-delivery slot (temp-bubble cleanup, background-review release, a deferred /goal
     notice) on the adapter for it (``_take_post_delivery``): run it after the send, as
@@ -535,8 +541,16 @@ async def _run_own_post_delivery(adapter, session_key, event):
     from gateway.platforms.base_post_delivery import run_post_delivery_callback, turn_run_generation
     generation, pop = turn_run_generation(event), getattr(adapter, 'pop_post_delivery_callback', None)
     if generation is not None and callable(pop):
-        await run_post_delivery_callback(
-            pop(session_key, generation=generation), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        # KC: the callbacks read this turn's delivery outcome (``last_delivery_complete``), as in
+        # ``_process_message_background``: an undelivered or partial reply keeps its progress card.
+        from gateway.platforms.base import _DELIVERY_OUTCOME
+        token = None if complete is None else _DELIVERY_OUTCOME.set((session_key, generation, bool(complete)))
+        try:
+            await run_post_delivery_callback(
+                pop(session_key, generation=generation), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        finally:
+            if token is not None:
+                _DELIVERY_OUTCOME.reset(token)
 
 
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
@@ -580,7 +594,9 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
-            await _run_own_post_delivery(adapter, session_key, event)
+            await _run_own_post_delivery(  # KC: False unless the send returned with every part delivered
+                adapter, session_key, event,
+                complete=delivered and getattr(delivery_event, '_kc_reply_complete', False))
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:
