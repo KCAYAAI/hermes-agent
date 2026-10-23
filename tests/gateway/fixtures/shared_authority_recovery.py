@@ -110,24 +110,32 @@ async def recover_probe(runner, adapter, source, peer):
     assert rows(authority, safe_sid) == initial
     assert not peer.requests
     recovered = await authority.recover_native_sessions([binding, (blocked_sid, source, adapter)])
-    assert recovered[blocked_sid] == 'unknown_execution', recovered
-    task = authority.sessions[safe_sid].task
-    if task is not None:
-        await asyncio.wait_for(task, 35)
+    first_boot = initial[0]['status'] != 'terminal'
+    # A person's lost turn no longer pauses its FIFO (gateway/session_restart_recovery.py): the
+    # follower they sent continues it. The lost head itself is never replayed.
+    assert recovered[blocked_sid] == ('recovering' if first_boot else 'ready'), recovered
+    for sid in (safe_sid, blocked_sid):
+        task = authority.sessions[sid].task
+        if task is not None:
+            await asyncio.wait_for(task, 35)
     safe = rows(authority, safe_sid)
     blocked = rows(authority, blocked_sid)
     assert safe[0]['status'] == 'terminal' and safe[0]['outcome'] == 'completed', safe
     assert safe[0]['payload'] == before['safe'][0]['payload']
-    assert next(r for r in blocked if r['request_id'] == 'crash-started')['status'] == 'unknown'
-    assert next(r for r in blocked if r['request_id'] == 'unknown-follower')['status'] == 'queued'
+    head = next(r for r in blocked if r['request_id'] == 'crash-started')
+    follower = next(r for r in blocked if r['request_id'] == 'unknown-follower')
+    assert (head['status'], head['outcome']) == ('terminal', 'interrupted'), blocked
+    assert (follower['status'], follower['outcome']) == ('terminal', 'completed'), blocked
     assert authority.sessions[safe_sid].source.platform == source.platform
-    assert authority.agent(SessionRef('default', blocked_sid)) is None
-    already_completed = initial[0]['status'] == 'terminal'
-    assert len(peer.requests) == (0 if already_completed else 1), peer.requests
+    already_completed = not first_boot
+    # Exactly the safe row and the follower reach the model, once each, on the first boot only.
+    assert len(peer.requests) == (0 if already_completed else 2), peer.requests
+    assert not any('BLOCK_FIFO_CRASH' in json.dumps(r['messages'][-1]) for r in peer.requests), peer.requests
     if not already_completed:
-        assert 'RECOVER_EXACTLY_ONCE' in json.dumps(peer.requests[0])
-        assert adapter.deliveries and all(d['chat_id'] == 'recover-chat' for d in adapter.deliveries)
-        assert any('LOCAL_ACK' in d['content'] for d in adapter.deliveries)
+        assert sum('RECOVER_EXACTLY_ONCE' in json.dumps(r['messages'][-1]) for r in peer.requests) == 1
+        # Each reply reaches its own chat: the safe row's in recover-chat, the follower's in its own.
+        assert {d['chat_id'] for d in adapter.deliveries} == {'recover-chat', source.chat_id}, adapter.deliveries
+        assert any('LOCAL_ACK' in d['content'] and d['chat_id'] == 'recover-chat' for d in adapter.deliveries)
     evidence = {'safe': safe, 'blocked': blocked, 'model_calls': len(peer.requests),
                 'deliveries': adapter.deliveries, 'recovery': recovered}
     Path(os.environ['HERMES_HOME'], 'recovery-receipt.json').write_text(json.dumps(evidence, indent=2))
