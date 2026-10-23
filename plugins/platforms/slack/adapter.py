@@ -360,6 +360,16 @@ class _NativeTaskCardStream:
     stream_ts: str = ""
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # The turn that opened this card. An owner-scoped stop/abandon from any other turn is a no-op,
+    # so a late finalizer from an old turn never closes a newer turn's card in the same thread.
+    owner: str = ""
+    # Set by abandon only: the owning turn gave this stream up while a call for it was in flight.
+    # Distinct from ``stopped``, which the normal stop and a deleted card also set.
+    retired: bool = False
+    # Every card ts chat.startStream returned for this stream, in order (the shown card and any
+    # expired predecessors). Recorded in the same step that sets ``stream_ts``, so the owning turn
+    # can always clean up a card that exists, whatever step of a publish a cancel cut short.
+    card_ids: list = field(default_factory=list)
 
 
 def check_slack_requirements() -> bool:
@@ -1928,6 +1938,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         # shutdown safety net for cancellation/reconnect races.
         for key, stream in list(self._native_task_card_streams.items()):
             await self._stop_native_task_card_stream(key, stream)
+        # Let a take-down of a retired card finish while the workspace clients are still open.
+        _disposals = list(self.__dict__.get("_task_card_disposals", ()))
+        if _disposals:
+            await asyncio.wait(_disposals, timeout=5.0)
         await self._stop_socket_mode_handler()
         await self._close_workspace_clients()
         self._app = self._app_token = self._proxy_url = self._bot_user_id = None
@@ -2090,7 +2104,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
     async def send_native_task_card_progress(
         self, chat_id: str, tasks: list[dict[str, str]], *, title: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
-        fallback_text: Optional[str] = None) -> SendResult:
+        fallback_text: Optional[str] = None, owner: Optional[str] = None) -> SendResult:
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
@@ -2102,7 +2116,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             return SendResult(success=False, error="No Slack thread target")
         stream = self._native_task_card_streams.get(key)
         if stream is None or stream.stopped:
-            stream = _NativeTaskCardStream(team_id=key[0], channel=chat_id, thread_ts=key[2])
+            stream = _NativeTaskCardStream(team_id=key[0], channel=chat_id, thread_ts=key[2], owner=owner or "")
             # No await between lookup and assignment, so racers share this lock.
             self._native_task_card_streams[key] = stream
         async with stream.lock:
@@ -2110,8 +2124,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                 return SendResult(success=False, error="Progress stream already stopped")
             try:
                 client = self._get_client(chat_id, team_id=stream.team_id)
-                if not stream.stream_ts:
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                if not stream.stream_ts and not await self._start_task_card(client, stream, metadata):
+                    return SendResult(success=False, error="Progress stream already stopped")
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2142,8 +2156,45 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     await self._delete_sealed_task_card(client, chat_id, sealed_ts)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
+                _task = asyncio.current_task()
+                if _task is not None and _task.cancelling():
+                    # Turn cleanup cancelled this update and the transport converted the cancel
+                    # into an ordinary error (aiohttp: CancelledError -> TimeoutError). Honour the
+                    # cancel instead of reporting a retryable failure that keeps the loop alive.
+                    raise asyncio.CancelledError() from exc
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def _start_task_card(self, client, stream: _NativeTaskCardStream, metadata) -> bool:
+        """chat.startStream a card for ``stream``, at the first frame and at a reopen. False when
+        the stream was retired (abandoned) while the start was in flight: its turn has already read
+        its cleanup list, so the adapter takes the new card down itself and the caller sends
+        nothing to it."""
+        await self._start_native_task_card_stream(client, stream, metadata)
+        if not stream.retired:
+            return True
+        self._dispose_retired_task_card(client, stream.channel, stream.stream_ts)
+        return False
+
+    def _dispose_retired_task_card(self, client, chat_id: str, ts: str) -> None:
+        """End and delete, in a task of its own, a card that was started for a stream nobody owns
+        any more. Not awaited by the sender on purpose: that sender can be cancelled at any moment
+        (handoff, turn cleanup), and its cancel must not skip the delete. Each call is cancelled
+        after ``_TASK_CARD_DISPOSAL_TIMEOUT_S``; disconnect waits briefly for the tasks still running."""
+        async def _dispose() -> None:
+            for method in ("chat.stopStream", "chat.delete"):
+                try:
+                    await asyncio.wait_for(
+                        client.api_call(method, json={"channel": chat_id, "ts": ts}), self._TASK_CARD_DISPOSAL_TIMEOUT_S)
+                except Exception as exc:
+                    logger.warning("[Slack] Could not %s retired task card %s: %s", method, ts, exc)
+
+        pending = self.__dict__.setdefault("_task_card_disposals", set())
+        task = asyncio.get_running_loop().create_task(_dispose())
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    _TASK_CARD_DISPOSAL_TIMEOUT_S = 15.0
 
     @staticmethod
     async def _delete_sealed_task_card(client, chat_id: str, ts: str) -> None:
@@ -2184,6 +2235,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
         if not stream.stream_ts:
             raise RuntimeError("Slack startStream returned no stream timestamp")
+        stream.card_ids.append(stream.stream_ts)  # no await since the answer: a cancel cannot split the two
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
@@ -2196,11 +2248,20 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             "status": status}
 
     async def _stop_native_task_card_stream(
-        self, key: tuple[str, str, str], stream: _NativeTaskCardStream) -> None:
+        self, key: tuple[str, str, str], stream: _NativeTaskCardStream,
+        on_card_ids: Optional[Callable[[list[str]], None]] = None) -> None:
         async with stream.lock:
             if stream.stopped:
                 return
             stream.stopped = True
+            if on_card_ids is not None:
+                # Under the lock and before any await: every card recorded on this stream, also one
+                # that another sender on the same stream started while this stop waited for the
+                # lock. After this no send can add one (a send that gets the lock sees ``stopped``).
+                try:
+                    on_card_ids(list(stream.card_ids))
+                except Exception:
+                    logger.debug("[Slack] task-card id hand-over failed", exc_info=True)
             try:
                 if self._app and stream.stream_ts:
                     await self._get_client(stream.channel, team_id=stream.team_id).api_call(
@@ -2213,14 +2274,57 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None) -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None,
+        on_card_ids: Optional[Callable[[list[str]], None]] = None) -> None:
+        """Finalize an active Slack-native progress stream exactly once.
+
+        With ``owner``, only the turn that opened the card may finalize it. ``on_card_ids`` is
+        called once, synchronously, with every card ts the stream started, at the moment the stop
+        holds the stream (see ``_stop_native_task_card_stream``)."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
             return
         stream = self._native_task_card_streams.get(key)
-        if stream is not None:
-            await self._stop_native_task_card_stream(key, stream)
+        if stream is None:
+            return
+        if owner and stream.owner and stream.owner != owner:
+            logger.debug("[Slack] Ignoring task-card stop from a turn that does not own card %s",
+                         stream.stream_ts)
+            return
+        await self._stop_native_task_card_stream(key, stream, on_card_ids)
+
+    def native_task_card_message_ids(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> list[str]:
+        """Every card ts Slack started for this turn's stream, without network I/O (empty: no
+        stream, another turn's card, or no card started yet). The gateway learns a card's id only
+        from a publish that returned success. A card whose first frame failed or was cancelled
+        after chat.startStream answered, and an expired card whose replacement was cut off before
+        the adapter deleted it, exist in the thread all the same; this is how their ids still reach
+        the turn's cleanup list."""
+        key = self._native_task_card_key(chat_id, reply_to, metadata)
+        stream = self._native_task_card_streams.get(key) if key is not None else None
+        if stream is None or (owner and stream.owner and stream.owner != owner):
+            return []
+        return list(stream.card_ids)
+
+    def abandon_native_task_card_progress(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> list[str]:
+        """Retire this turn's card stream WITHOUT network I/O (its updater is stuck). The next
+        turn in the thread opens a fresh card instead of queueing behind the stuck lock. Returns
+        the ts of every card the retired stream started (empty: nothing retired, or no card yet)
+        so the caller can still clean them up. A start that answers after this is taken down by
+        the adapter (``_start_task_card``)."""
+        key = self._native_task_card_key(chat_id, reply_to, metadata)
+        if key is None:
+            return []
+        stream = self._native_task_card_streams.get(key)
+        if stream is None or (owner and stream.owner and stream.owner != owner):
+            return []
+        stream.stopped = stream.retired = True
+        self._native_task_card_streams.pop(key, None)
+        return list(stream.card_ids)
 
     def _suppressed_ignored(self, chat_id: str, what: str, *, level: int = logging.WARNING) -> bool:
         """True (after logging) when ``chat_id`` is a configured ignored channel."""
