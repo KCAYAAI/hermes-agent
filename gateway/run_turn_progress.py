@@ -10,7 +10,7 @@ import threading
 import time
 from contextlib import suppress
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
 
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
@@ -186,7 +186,9 @@ class GatewayTurnProgressMixin:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            message_id = str(result.message_id)
+            if message_id not in ctx._cleanup_msg_ids:  # a card update returns the same id each time
+                ctx._cleanup_msg_ids.append(message_id)
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -418,22 +420,39 @@ class GatewayTurnProgressMixin:
         # dynamically so the state is visible where it lives.
         publication_suppressed: bool = False
         anonymous_seq: int = 0
+        started: float = dataclasses.field(default_factory=time.monotonic)
+        VISIBLE: ClassVar[int] = 5
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
             text = re.sub(r"\s+", " ", str(value or "")).strip()
             return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
+        def title(self) -> str:
+            mins = int((time.monotonic() - self.started) // 60)
+            return f"Working · {mins} min" if mins >= 1 else "Working"
+
         def visible_tasks(self) -> list[dict[str, str]]:
-            return [self.tasks[task_id] for task_id in self.task_order[-8:]]
+            order = self.task_order
+            recent = [self.tasks[task_id] for task_id in order[-self.VISIBLE:]]
+            earlier = [self.tasks[task_id] for task_id in order[: -self.VISIBLE]]
+            if not earlier:
+                return recent
+            failed = sum(1 for t in earlier if t["status"] == "error")
+            recovered = sum(1 for t in earlier if t.get("recovered"))
+            running = any(t["status"] == "in_progress" for t in earlier)
+            label = f"{len(earlier)} earlier step{'s' if len(earlier) != 1 else ''}"
+            if failed:
+                label += f" ({failed} failed)"
+            elif recovered:
+                label += f" ({recovered} recovered)"
+            status = "in_progress" if running else ("error" if failed else "complete")
+            return [{"id": "earlier_steps", "title": label, "status": status}] + recent
 
         def fallback_text(self) -> str:
-            labels = {"in_progress": t("gateway.progress.task_status_running"),
-                      "complete": t("gateway.progress.task_status_complete"),
-                      "error": t("gateway.progress.task_status_error")}
-            lines = [t("gateway.progress.task_line", title=task["title"], status=labels.get(task["status"], task["status"]))
-                     for task in self.visible_tasks()]
-            return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
+            labels = {"in_progress": "running", "complete": "done", "error": "failed"}
+            lines = [f"- {task['title']} - {labels.get(task['status'], task['status'])}" for task in self.visible_tasks()]
+            return self.title() + "\n" + "\n".join(lines)
 
         def _upsert(self, call_id: str, title: str) -> dict[str, str]:
             if call_id not in self.tasks:
@@ -450,15 +469,32 @@ class GatewayTurnProgressMixin:
                 self.anonymous_seq += 1
                 call_id = f"anonymous_{self.anonymous_seq}"
             tool_name = str(raw.get("tool_name") or "tool")
+            from gateway.progress_text import friendly_step
             if event_type == "tool.started":
-                preview = self._compact(raw.get("preview"), 64)
-                self._upsert(call_id, f"{tool_name} - {preview}" if preview else tool_name)
+                self._upsert(call_id, friendly_step(tool_name, raw.get("preview")))
                 return True
             # Completion-only events are rare but valid on some runtimes; keep their real ID instead
             # of guessing a same-name pending call.
-            task = self.tasks.get(call_id) or self._upsert(call_id, tool_name)
-            task["status"] = "error" if raw.get("is_error") else "complete"
+            task = self.tasks.get(call_id) or self._upsert(call_id, friendly_step(tool_name))
+            if raw.get("is_error"):
+                task["status"] = "error"
+            else:
+                task["status"] = "complete"
+                self._mark_recovered(call_id)
             return True
+
+        def _mark_recovered(self, succeeded_id: str) -> None:
+            """A later step succeeded, so earlier failures were worked past: clear their error
+            status (Slack shows a card-wide warning while any task is ``error``) but keep the
+            fact visible in the title. A run that ENDS on a failure keeps its error."""
+            for task_id in self.task_order:
+                if task_id == succeeded_id:
+                    break
+                task = self.tasks[task_id]
+                if task["status"] == "error":
+                    task["status"] = "complete"
+                    task["recovered"] = True
+                    task["title"] = self._compact(f"{task['title']} (error, recovered)")
 
     async def _task_card_send_or_edit_fallback(self, st) -> None:
         ctx = self._ctx
@@ -510,10 +546,13 @@ class GatewayTurnProgressMixin:
                 return
         if not st.native_failed:
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
+                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=st.title(),
                 reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
             )
             if getattr(result, "success", False):
+                # The native card is temporary progress UI like any bubble: with cleanup_progress it
+                # is deleted after the final reply is delivered, and kept on a failed run.
+                self._track_progress_result(result)
                 return
             # P5(b): an AUTHORIZATION decline is not a broken card lane. The
             # fallback below sends the same task text to the same chat, which
