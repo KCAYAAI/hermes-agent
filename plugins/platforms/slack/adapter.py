@@ -68,6 +68,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_reactions_context import slack_reactions_marker
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_image_batch import collect_image_uploads
+    from . import reaction_ledger as _rl
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
@@ -75,6 +76,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
+    import reaction_ledger as _rl  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -1114,6 +1116,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         self._thread_context_cache: dict[str, _ThreadContextCache] = {}
         # Last Agent Sessions lifecycle value written per (team, channel, thread).
         self._agent_session_states: dict[tuple[str, str, str], tuple[str, float]] = {}
+        # Per-thread lifecycle write ordering (lock) and invalidation (generation bumped by clears).
+        self._status_write_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._status_generations: dict[tuple[str, str, str], int] = {}
+        self._status_inflight: dict[tuple[str, str, str], tuple[asyncio.Future, int]] = {}
         self._status_loop: Optional[asyncio.AbstractEventLoop] = None
         # Threads already rehydration-checked this process (first reply after a restart injects
         # missed messages exactly once); message IDs with reaction lifecycle (bounded: an exception
@@ -1128,6 +1134,11 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         # Native progress streams; each owns a lock so concurrent start/append/stop
         # can't create duplicates or append after finalization.
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
+        # Request reactions (👀/✅/❌) are owned by one durable ledger; see reaction_ledger.py.
+        self._reactions = _rl.ReactionLedger(self)
+        # id(event) -> [event, open turns, (team, ts, thread)]: tells a re-reported completion
+        # (same event, no open turn) from a real one, so a worse re-report still lands.
+        self._event_turns: dict[int, list] = {}
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
@@ -1834,6 +1845,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     logger.debug("[Slack] Cleanup after failed start raised", exc_info=True)
                 raise
             logger.info("[Slack] Socket Mode connected (%d workspace(s))", len(self._team_clients))
+            with contextlib.suppress(Exception):
+                self._reactions.attach(self._reaction_ledger_path())
+                self._reactions.begin()
             self._hint_allow_bots()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1901,6 +1915,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        # Finish what can finish; anything left stays in the ledger file for the next process.
+        await self._reactions.shutdown(timeout=10.0)
+
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for key, stream in list(self._active_streams.items()):
             await self._seal_stream(key, stream)
@@ -2116,14 +2133,24 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
-                    stream.stream_ts = ""
+                    sealed_ts, stream.stream_ts = stream.stream_ts, ""
                     await self._start_native_task_card_stream(client, stream, metadata)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
+                    # One card per turn: the new card now carries the full projection, so the
+                    # sealed one is a stale duplicate. Delete it only after its replacement is live.
+                    await self._delete_sealed_task_card(client, chat_id, sealed_ts)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), retryable=True)
+
+    @staticmethod
+    async def _delete_sealed_task_card(client, chat_id: str, ts: str) -> None:
+        try:
+            await client.api_call("chat.delete", json={"channel": chat_id, "ts": ts})
+        except Exception as exc:
+            logger.debug("[Slack] Could not delete sealed task card %s: %s", ts, exc)
 
     @staticmethod
     async def _start_native_task_card_stream(
@@ -2445,6 +2472,15 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             if cached == str(message_id) and key[0] == str(chat_id):
                 self._status_message_ids.pop(key, None)
 
+    def _forget_native_task_card(self, chat_id: str, message_id: str) -> None:
+        """Retire a task-card stream whose message was just deleted. A cancelled turn can skip
+        stop_native_task_card_progress, so without this the next turn in the thread appends to a
+        deleted ts (message_not_found) and every card update degrades to text bubbles."""
+        for key, stream in list(self._native_task_card_streams.items()):
+            if stream.channel == str(chat_id) and stream.stream_ts == str(message_id):
+                stream.stopped = True
+                self._native_task_card_streams.pop(key, None)
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot message (used to clean up temporary progress bubbles)."""
         if not self._app:
@@ -2454,6 +2490,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         try:
             response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
             if not (hasattr(response, "get") and response.get("ok") is False):
+                self._forget_native_task_card(chat_id, message_id)
                 return True
             logger.debug(
                 "[Slack] chat.delete returned ok=false for message %s in channel %s: %s",
@@ -2775,11 +2812,71 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         _status = _status or self._default_status_text(_status_started)
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
 
+    def _status_write_lock(self, key: tuple[str, str, str]) -> asyncio.Lock:
+        """Per-thread lock so lifecycle writes reach Slack in the order they were issued."""
+        locks = self._status_write_locks
+        lock = locks.get(key)
+        if lock is None:
+            lock = locks[key] = asyncio.Lock()
+            self._evict_oldest_by_ts(locks, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
+        return lock
+
+    def _status_generation(self, key: Optional[tuple[str, str, str]]) -> int:
+        return self._status_generations.get(key, 0) if key else 0
+
+    def _bump_status_generation(self, key: Optional[tuple[str, str, str]]) -> None:
+        """Invalidate lifecycle writes scheduled before this point (the turn's final clear wins)."""
+        if not key:
+            return
+        gens = self._status_generations
+        gens[key] = gens.get(key, 0) + 1
+        self._evict_oldest_by_ts(gens, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
+
     async def _set_thread_status(
+        self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str,
+        *, generation: Optional[int] = None) -> None:
+        """Thread status write (empty ``status`` clears). Writes for one thread are serialized,
+        and a write scheduled under an older ``generation`` is dropped, so a queued or in-flight
+        pause can never land after the turn's final clear."""
+        key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
+        if key is None:
+            await self._set_thread_status_unlocked(chat_id, team_id, thread_ts, status, fail_label)
+            return
+        async with self._status_write_lock(key):
+            started_gen = self._status_generation(key)
+            if generation is not None and generation != started_gen:
+                logger.debug("[Slack] dropped stale thread status %s for %s", status, key)
+                return
+            # Run the API call as its own task so a later clear can cancel it while it is still
+            # in flight (see _cancel_stale_status_write) without cancelling this caller.
+            inner = asyncio.ensure_future(
+                self._set_thread_status_unlocked(chat_id, team_id, thread_ts, status, fail_label))
+            self._status_inflight[key] = (inner, started_gen)
+            try:
+                await inner
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if inner.cancelled() and not (current and current.cancelling()):
+                    logger.debug("[Slack] cancelled stale in-flight thread status %s for %s", status, key)
+                    return
+                raise
+            finally:
+                if self._status_inflight.get(key, (None, 0))[0] is inner:
+                    self._status_inflight.pop(key, None)
+
+    def _cancel_stale_status_write(self, key: Optional[tuple[str, str, str]]) -> None:
+        """Cancel an in-flight lifecycle write that started before the current generation, so
+        the turn's final clear does not wait behind (or get overwritten by) an older pause."""
+        if not key:
+            return
+        inflight = self._status_inflight.get(key)
+        if inflight and inflight[1] < self._status_generation(key) and not inflight[0].done():
+            inflight[0].cancel()
+
+    async def _set_thread_status_unlocked(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """Thread status write (empty ``status`` clears). Agent Sessions receives lifecycle values
-        only and repeats of the same value are skipped; the legacy Assistant API receives the
-        text line. Failures are debug-logged."""
+        """Agent Sessions receives lifecycle values only and repeats of the same value are
+        skipped; the legacy Assistant API receives the text line. Failures are debug-logged."""
         try:
             client = self._get_client(chat_id, team_id=team_id)
             if _uses_agent_sessions(client):
@@ -2825,9 +2922,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             team_id, thread_ts = entry.get("team_id", ""), entry.get("thread_ts", "")
             if not thread_ts or not _uses_agent_sessions(self._get_client(chat_id, team_id=team_id)):
                 continue
+            # Captured now, checked when the write runs: a clear issued in between wins.
+            generation = self._status_generation(
+                self._workspace_thread_key(team_id, chat_id, str(thread_ts)))
             with contextlib.suppress(RuntimeError):
                 asyncio.run_coroutine_threadsafe(
-                    self._set_thread_status(chat_id, team_id, thread_ts, status, status), loop)
+                    self._set_thread_status(
+                        chat_id, team_id, thread_ts, status, status, generation=generation), loop)
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -2877,6 +2978,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
             thread_ts = requested_thread_ts
         if not thread_ts:
             return
+        clear_key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
+        self._bump_status_generation(clear_key)
+        self._cancel_stale_status_write(clear_key)
         await self._set_thread_status(chat_id, team_id, thread_ts, "", "clear failed")
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
@@ -3299,27 +3403,134 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         target = self._reacting_target(event)
-        if target is None:
+        channel_id = getattr(event.source, "chat_id", None)
+        if target is None or not channel_id:
             return
         ts, team_id, _marker = target
-        channel_id = getattr(event.source, "chat_id", None)
-        if channel_id:
-            await self._react(channel_id, ts, "eyes", team_id, remove=False)
+        thread = str(getattr(event.source, "thread_id", None) or ts)
+        rec = self._event_turns.get(id(event))
+        if rec is not None and rec[0] is event:
+            rec[1] += 1
+        else:
+            self._remember_event(event, 1, None)
+        await self._reactions.start(team_id, str(channel_id), str(ts), thread)
+
+    def _remember_event(self, event: Any, open_turns: int, where: Any) -> None:
+        """Track started-minus-completed turns per event object (holding a reference keeps
+        ``id`` unique while tracked), bounded to recent events."""
+        self._event_turns[id(event)] = [event, open_turns, where]
+        if len(self._event_turns) > 4096:
+            # Evict closed events first (oldest first); never an event with an open turn.
+            for k in [k for k, r in self._event_turns.items() if r[1] <= 0][:len(self._event_turns) - 4096]:
+                self._event_turns.pop(k, None)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Hand the turn's outcome to the ledger, which settles 👀 into ✅/❌ when work is done."""
+        channel_id = getattr(event.source, "chat_id", None)
+        rec = self._event_turns.get(id(event))
+        if rec is not None and rec[0] is event and rec[1] <= 0 and rec[2]:
+            # Every started turn of this event already completed: this is a re-report (the first
+            # completion was cancelled mid-call and the gateway reports FAILURE/CANCELLED).
+            # Only a worse outcome can change anything; the turn count is untouched.
+            team_id, ts, thread = rec[2]
+            await self._reactions.revise(team_id, str(channel_id), ts, thread, _rl.outcome_name(outcome))
+            return
         target = self._reacting_target(event)
         if target is None:
             return
         ts, team_id, marker = target
-        self._reacting_message_ids.discard(marker)
-        channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
+            self._reacting_message_ids.discard(marker)
             return
-        await self._react(channel_id, ts, "eyes", team_id, remove=True)
-        final = {ProcessingOutcome.SUCCESS: "white_check_mark", ProcessingOutcome.FAILURE: "x"}
-        if outcome in final:
-            await self._react(channel_id, ts, final[outcome], team_id, remove=False)
+        thread = str(getattr(event.source, "thread_id", None) or ts)
+        # Overlapping turns on one message share the marker; drop it only after the last one.
+        if self._reactions.active_turns(team_id, str(channel_id), str(ts)) <= 1:
+            self._reacting_message_ids.discard(marker)
+        rec = self._event_turns.get(id(event))
+        if rec is not None and rec[0] is event:
+            rec[1] -= 1
+            rec[2] = (team_id, str(ts), thread)
+        else:
+            self._remember_event(event, 0, (team_id, str(ts), thread))
+        await self._reactions.complete(team_id, str(channel_id), str(ts), thread, _rl.outcome_name(outcome))
+
+    async def finish_deferred_reactions(
+        self, channel_id: str, thread_ts: str, *, failed: bool = False, failed_at: Optional[float] = None,
+        team_id: Optional[str] = None,
+    ) -> int:
+        """Background work in a thread settled: close its held messages (see ReactionLedger.settle)."""
+        return await self._reactions.settle(channel_id, thread_ts, team_id, failed=failed, failed_at=failed_at)
+
+    # ----- ReactionLedger transport -----
+
+    def _reaction_ledger_path(self) -> Optional[_Path]:
+        bots = sorted(f"{t}-{u}" for t, u in self._team_bot_user_ids.items() if u) or [self._bot_user_id or ""]
+        if not bots[0]:
+            return None
+        from hermes_constants import get_process_hermes_home
+        return get_process_hermes_home() / "state" / f"slack-reactions-{bots[0]}.json"
+
+    def hold_state(self, entry: Any) -> Optional[str]:
+        from gateway.reaction_deferral import completion_state
+        return completion_state(chat_id=entry.channel, thread_id=entry.thread, message_id=entry.ts,
+                                adapter=self, team_id=entry.team)
+
+    def is_live(self, team: str, channel: str, ts: str) -> bool:
+        return self._workspace_message_marker(team, ts) in self._reacting_message_ids
+
+    async def react(self, team: str, channel: str, ts: str, name: str, remove: bool) -> str:
+        if not self._app:
+            return _rl.FAIL
+        try:
+            client = self._get_client(channel, team_id=team or None)
+            method = client.reactions_remove if remove else client.reactions_add
+            await method(channel=channel, timestamp=ts, name=name)
+            return _rl.OK
+        except Exception as e:
+            result = _rl.classify(e, remove)
+            if result != _rl.OK:
+                logger.debug("[Slack] reactions.%s %s on %s/%s: %s", "remove" if remove else "add", name, channel, ts, e)
+            return result
+
+    async def read(self, team: str, channel: str, ts: str) -> Any:
+        if not self._app:
+            return None
+        try:
+            client = self._get_client(channel, team_id=team or None)
+            resp = await client.reactions_get(channel=channel, timestamp=ts, full=True)
+            uid = self._team_bot_user_ids.get(team, self._bot_user_id) or ""
+            return _rl.own_names((resp or {}).get("message"), uid)
+        except Exception as e:
+            if _rl.classify(e, remove=False) == _rl.GONE:
+                return _rl.GONE
+            logger.debug("[Slack] reactions.get on %s/%s: %s", channel, ts, e)
+            return None
+
+    async def recent_own(self) -> Optional[list]:
+        """The bot's own reactions from the last day, newest first (1-2 calls per workspace)."""
+        if not self._app:
+            return None
+        out, now = [], time.time()
+        teams = dict(self._team_bot_user_ids) or {"": self._bot_user_id or ""}
+        for team, uid in teams.items():
+            if not uid:
+                continue
+            client = self._team_clients.get(team) or self._app.client
+            cursor = ""
+            for _ in range(5):
+                try:
+                    resp = await client.reactions_list(user=uid, limit=100, full=True,
+                                                       **({"cursor": cursor} if cursor else {}))
+                except Exception as e:
+                    logger.debug("[Slack] reactions.list: %s", e)
+                    return out or None
+                page = _rl.items_within([resp], _rl.SWEEP_WINDOW_SECONDS, now)
+                out.extend((team, ch, ts, _rl.own_names(msg, uid)) for ch, ts, msg in page)
+                items = (resp or {}).get("items") or []
+                cursor = ((resp or {}).get("response_metadata") or {}).get("next_cursor", "")
+                if not cursor or len(page) < len(items):
+                    break  # reached messages older than the window
+        return out
 
     # ----- User identity resolution -----
 
@@ -6144,7 +6355,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         """True only for a root posted by an active human Slack user (no bot/app/webhook author)
         who also passes this profile's sender authorization (excludes outside guests)."""
         user_id = str(root.get("user") or "")
-        if not user_id or root.get("bot_id") or root.get("subtype") in {"bot_message", "app_message"}:
+        # The canonical bot predicate also covers bot_profile, user_profile.is_bot, and
+        # app-posted roots without client_msg_id (workflow/app PDFs are the common case).
+        if (not user_id or root.get("subtype") in {"bot_message", "app_message"}
+                or self._event_declares_bot_sender(root)):
             return False
         try:
             payload = await self._users_info_payload(user_id, channel_id, team_id)
@@ -6159,7 +6373,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         # A configured callback must explicitly approve before a private download.
         if self._authorization_check is None:
             return True
-        return self._is_sender_authorized(user_id, "group", channel_id) is True
+        # Same chat-type convention as every other authorization site in this adapter.
+        chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
+        return self._is_sender_authorized(user_id, chat_type, channel_id) is True
 
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
