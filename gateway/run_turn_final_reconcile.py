@@ -19,6 +19,16 @@ logger = logging.getLogger("gateway.run")
 
 _FLOOD_WAIT_SLACK_SECS = 1.0
 _MAX_FLOOD_WAITS = 2
+# KC: one streamed-reply edit that never returns must not hold the reply. The in-place final edit
+# (edit_streamed_message) is one bounded attempt with no flood retry, as on live; on timeout the
+# edit keeps running (shielded) and ``already_sent`` stays unset, so the normal final send delivers.
+# None restores upstream's unbounded edit with flood retries.
+_STREAMED_EDIT_TIMEOUT_S: Optional[float] = 15.0
+# KC: upstream finishes an unconfirmed, flood-frozen preview in place. Off on KC (live has no such
+# branch): under the edit bound a late edit could land after the normal final send (a second
+# complete reply), and a detached stream consumer may still overwrite the preview. The normal final
+# send delivers instead, as on live.
+KC_FINISH_UNCONFIRMED_PREVIEW_IN_PLACE = False
 
 # ``edit_preview_to_final`` result when the turn was replaced (/new, /stop) before or during a wait:
 # nothing more is owed. Distinct from an adapter edit that returned no receipt (``None``), which the
@@ -86,7 +96,8 @@ def _accepts_metadata(edit_message: Any) -> bool:
 
 async def edit_preview_to_final(adapter: Any, chat_id: str, message_id: str, content: str,
                                 metadata: Any = None, *,
-                                still_current: Optional[Callable[[], bool]] = None) -> Any:
+                                still_current: Optional[Callable[[], bool]] = None,
+                                edit_timeout: Optional[float] = None) -> Any:
     """``edit_message(finalize=True)``, retried after each flood refusal the platform asked to wait
     out for at most the final send's inline cap. A split whose head landed while its tail was refused
     resumes only the certain-undelivered tail, never the head again; a tail that still fails is left
@@ -97,12 +108,22 @@ async def edit_preview_to_final(adapter: Any, chat_id: str, message_id: str, con
     def _current() -> bool:
         return still_current is None or bool(still_current())
 
+    async def _edit() -> Any:
+        # KC: ``edit_timeout`` bounds each single edit call (None = upstream, unbounded).
+        if edit_timeout is None:
+            return await adapter.edit_message(**kwargs)
+        return await asyncio.wait_for(asyncio.shield(adapter.edit_message(**kwargs)), timeout=edit_timeout)
+
     kwargs: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "content": content, "finalize": True}
     if metadata and _accepts_metadata(adapter.edit_message):
         kwargs["metadata"] = metadata
     if not _current():
         return TURN_REPLACED
-    result = await adapter.edit_message(**kwargs)
+    result = await _edit()
+    if edit_timeout is not None:
+        # KC: a bounded edit is one attempt, as on live. A flood retry that outlives the bound
+        # would land after the caller's normal final send and show the answer twice.
+        return result
     for _ in range(_MAX_FLOOD_WAITS):
         if getattr(result, "success", True):
             return result
@@ -121,7 +142,7 @@ async def edit_preview_to_final(adapter: Any, chat_id: str, message_id: str, con
                 return result
             result = resumed
         else:
-            result = await adapter.edit_message(**kwargs)
+            result = await _edit()
     return result
 
 
@@ -134,9 +155,9 @@ async def edit_streamed_message(consumer: Any, source: Any, response: dict, cont
     try:
         result = await edit_preview_to_final(
             consumer.adapter, source.chat_id, consumer.message_id, content, getattr(consumer, "metadata", None),
-            still_current=getattr(consumer, "_run_still_current", None))
+            still_current=getattr(consumer, "_run_still_current", None), edit_timeout=_STREAMED_EDIT_TIMEOUT_S)
     except Exception as edit_err:  # health: allow BLE001 -- any edit failure falls back to the normal final send
-        logger.warning(fail_exc, sk, edit_err)
+        logger.warning(fail_exc, sk, repr(edit_err))  # KC: a bound's TimeoutError has no message
         return
     if result is TURN_REPLACED:
         return  # its stale-run discard owns what happens next

@@ -51,6 +51,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_STREAM_FLUSH_TIMEOUT_S = 5.0
 
 _tool_call_logger_lock = threading.Lock()
 
@@ -1143,13 +1144,16 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
     @staticmethod
     async def _await_stream_task(stream_task) -> None:
-        """Give the stream consumer task 5s to flush, then cancel it."""
+        """Give the stream consumer task 5s to flush, then cancel it (bounded: a consumer that
+        ignores the cancel is detached instead of holding the reply)."""
+        from gateway.turn_cleanup import join_cancelled_task
         try:
-            await asyncio.wait_for(stream_task, timeout=5.0)
+            await asyncio.wait_for(asyncio.shield(stream_task), timeout=_STREAM_FLUSH_TIMEOUT_S)
         except (TimeoutError, asyncio.CancelledError):
             stream_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stream_task
+            await join_cancelled_task(stream_task, label="stream consumer")
+        except Exception:
+            logger.debug("stream consumer failed during cleanup", exc_info=True)
 
     async def _run_agent_track_agent(self, turn_ctx: TurnContext) -> None:
         """Track this agent as running for the session (interrupt support) once it is created — only
@@ -1822,7 +1826,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _notify_task: asyncio.Task, tracking_task: asyncio.Task, stream_task: Any,
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
+        from gateway.turn_cleanup import join_cancelled_task
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
+        # Closing: progress loops stop publishing and never open a NEW text fallback from here on.
+        _stop = getattr(turn_ctx, "_progress_stop", None)
+        if _stop is not None:
+            _stop.set()
         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
             if task:
                 task.cancel()
@@ -1831,8 +1840,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # No stream consumer was created: nothing to flush, cancel instead of waiting out 5s.
             if not (stream_consumer_holder and stream_consumer_holder[0] is not None):
                 stream_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stream_task
+                await join_cancelled_task(stream_task, label="stream poller", session_key=session_key)
             else:
                 await self._await_stream_task(stream_task)
 
@@ -1852,15 +1860,33 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         if self._draining:
             self._update_runtime_status("draining")
 
-        for task in (progress_task, log_task, interrupt_monitor, tracking_task, _notify_task):
-            if task:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    # A background task that died of a real error must not abort the cleanup path.
-                    logger.debug("background turn task failed during cleanup", exc_info=True)
+        # Bounded joins: a task that swallows its cancel (e.g. a transport converting CancelledError
+        # into TimeoutError) is detached after a fixed budget instead of holding this turn's reply
+        # and its session admission forever. Real task errors still never abort cleanup.
+        for label, task in (("progress", progress_task), ("tool log", log_task),
+                            ("interrupt monitor", interrupt_monitor), ("agent tracking", tracking_task),
+                            ("long-running notify", _notify_task)):
+            if task and not await join_cancelled_task(task, label=label, session_key=session_key):
+                if task is progress_task:
+                    self._run_agent_abandon_task_card(turn_ctx)
+
+    def _run_agent_abandon_task_card(self, turn_ctx: TurnContext) -> None:
+        """A detached progress task still owns this thread's native card: retire that stream (no
+        network) so the next turn opens its own card instead of queueing behind the stuck one.
+        From here on that sender publishes nothing (``_task_card_publish``): its stream is stopped,
+        so a late publish would open a NEW card that no cleanup list holds."""
+        turn_ctx._progress_abandoned = True
+        with suppress(Exception):
+            adapter = self._delivery_adapter_for(turn_ctx.source)
+            abandon = getattr(adapter, "abandon_native_task_card_progress", None)
+            if callable(abandon):
+                retired = abandon(turn_ctx.source.chat_id, reply_to=turn_ctx._progress_reply_to,
+                                  metadata=turn_ctx._progress_metadata, owner=getattr(turn_ctx, "_progress_owner", None))
+                # The stuck sender never reaches its own bookkeeping: keep the retired stream's card
+                # ids for this turn's bubble cleanup, which reads the list right after this.
+                for ts in retired if isinstance(retired, (list, tuple)) else ():
+                    if isinstance(ts, str) and ts and turn_ctx._cleanup_progress and ts not in turn_ctx._cleanup_msg_ids:
+                        turn_ctx._cleanup_msg_ids.append(ts)
 
     async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
         """Set ``response["already_sent"]`` when streaming already delivered the final reply.
@@ -1869,6 +1895,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         its viewer prints only the completion text, never the deltas (#139666). Both flags reflect call
         success, not content: a mismatch with the recorded turn-final payload never suppresses."""
         from gateway.run_turn_final_reconcile import edit_streamed_message, owns_reconcilable_preview
+        import gateway.run_turn_final_reconcile as _rec  # KC: read the switch at call time
         from gateway.session_finite import finite_turn_required
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
         if not isinstance(response, dict) or response.get("failed") or finite_turn_required() is True:
@@ -1936,7 +1963,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
                     fail_exc="Failed to edit streamed message for session %s: %s",
                 )
-        elif not _transformed and owns_reconcilable_preview(_sc, getattr(source, "chat_id", ""), _final):
+        elif (_rec.KC_FINISH_UNCONFIRMED_PREVIEW_IN_PLACE and not _transformed
+              and owns_reconcilable_preview(_sc, getattr(source, "chat_id", ""), _final)):
             # Unconfirmed final, one real preview on screen (a flood-frozen bubble, a cancelled
             # consumer): finish it in place; a plain final send would post the answer twice.
             await edit_streamed_message(
@@ -2145,19 +2173,34 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
-            await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            from gateway.turn_cleanup import stall_watchdog
+            with stall_watchdog("post-turn finalize", session_key):
+                await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+                pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
+                # Closing, as in turn cleanup: set before the senders are cancelled, so the task-card
+                # sender publishes nothing after the handoff (no card or text bubble that could land
+                # after the cleanup list is read).
+                turn_ctx._progress_handoff = True
+                turn_ctx._progress_stop.set()
                 await settle_turn_senders(progress_task, _notify_task)  # their bubble ids join this turn's cleanup
+                if progress_task is not None and not progress_task.done():
+                    # The sender outlived the settle bound (a transport that swallowed its cancel). Retire
+                    # its card stream now, as turn cleanup does, so the follow-up opens its own card
+                    # instead of queueing behind the stuck one for the whole follow-up.
+                    self._run_agent_abandon_task_card(turn_ctx)
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
         finally:
-            await self._run_agent_cleanup_turn_tasks(
-                turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
-                _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
-            )
+            from gateway.turn_cleanup import stall_watchdog
+            with stall_watchdog("turn cleanup", session_key):
+                await self._run_agent_cleanup_turn_tasks(
+                    turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
+                    _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
+                )
 
-        await self._run_agent_mark_streamed_delivery(response, turn_ctx)
+        with stall_watchdog("streamed-delivery reconciliation", session_key):
+            await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         register_bubble_cleanup(response, turn_ctx)
         return response
