@@ -309,9 +309,81 @@ class NativeTaskCardAdapter(ProgressCaptureAdapter):
 
 
 class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
+    """A permanent card failure (not retryable): the turn switches to one editable text bubble."""
+
     async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
         await super().send_native_task_card_progress(*args, **kwargs)
-        return SendResult(success=False, error="native stream unavailable", retryable=True)
+        return SendResult(success=False, error="native stream unavailable", retryable=False)
+
+
+class FlakyNativeTaskCardAdapter(NativeTaskCardAdapter):
+    """One transient card failure (a transport timeout), then healthy again."""
+
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        if len(self.native_updates) == 1:
+            return SendResult(success=False, error="TimeoutError", retryable=True)
+        return SendResult(success=True, message_id="native-stream-1")
+
+
+class AlwaysTransientNativeTaskCardAdapter(NativeTaskCardAdapter):
+    """Every card frame times out: after the bounded retries the turn falls back to text."""
+
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        return SendResult(success=False, error="TimeoutError", retryable=True)
+
+
+class LiveThenPermanentFailTaskCardAdapter(NativeTaskCardAdapter):
+    """The card is shown, then every later frame fails permanently."""
+
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        if len(self.native_updates) == 1:
+            return SendResult(success=True, message_id="native-stream-1")
+        return SendResult(success=False, error="stream broken", retryable=False)
+
+
+class LiveThenAlwaysTransientTaskCardAdapter(NativeTaskCardAdapter):
+    """The card is shown, then every later frame times out."""
+
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        if len(self.native_updates) == 1:
+            return SendResult(success=True, message_id="native-stream-1")
+        return SendResult(success=False, error="TimeoutError", retryable=True)
+
+
+class FailThenHangThenOkTaskCardAdapter(NativeTaskCardAdapter):
+    """Frame 1 times out, the timer resend (frame 2) hangs until cancelled, later frames work."""
+
+    async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
+        await super().send_native_task_card_progress(*args, **kwargs)
+        n = len(self.native_updates)
+        if n == 1:
+            return SendResult(success=False, error="TimeoutError", retryable=True)
+        if n == 2:
+            await asyncio.sleep(30)
+        return SendResult(success=True, message_id="native-stream-1")
+
+
+class StartThenSlowAgent:
+    """One tool starts and finishes at once; the turn then runs on with no new events."""
+
+    def __init__(self, **kwargs):
+        self.tool_start_callback = kwargs.get("tool_start_callback")
+        self.tool_complete_callback = kwargs.get("tool_complete_callback")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        start = self.tool_start_callback or (lambda *a, **k: None)
+        complete = self.tool_complete_callback or (lambda *a, **k: None)
+        start("call-a", "web_search", {"query": "alpha"})
+        time.sleep(0.02)
+        complete("call-a", "web_search", {"query": "alpha"}, '{"success": true}')
+        time.sleep(0.6)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
 class DuplicateNativeToolsAgent:
@@ -1206,6 +1278,52 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
     assert adapter.edits[-1]["content"].endswith("Searching the web for beta - failed")
     assert "Searching the web for alpha - done" in adapter.edits[-1]["content"]
+    assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_transient_card_failure_keeps_the_native_card(monkeypatch, tmp_path):
+    """One timed-out card frame must not turn the rest of the turn into a text bubble: the next
+    frame carries the full projection to the same card (KC: working cards showed up as text)."""
+    _fast_card_backoff(monkeypatch)
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, DuplicateNativeToolsAgent, session_id="sess-native-flaky",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=FlakyNativeTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert len(adapter.native_updates) >= 2
+    final = {task["title"]: task["status"] for task in adapter.native_updates[-1]["tasks"]}
+    assert final == {"Searching the web for alpha": "complete", "Searching the web for beta": "error"}
+    assert adapter.native_stops == 1
+
+
+def _fast_card_backoff(monkeypatch, seconds=0.05):
+    from gateway.run_turn_progress import GatewayTurnProgressMixin
+    monkeypatch.setattr(GatewayTurnProgressMixin._TaskCardState, "RETRY_BACKOFF", seconds)
+
+
+@pytest.mark.asyncio
+async def test_slack_repeated_transient_card_failures_fall_back_to_one_text_bubble(
+    monkeypatch, tmp_path
+):
+    _fast_card_backoff(monkeypatch)  # the timer resends during the turn
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, DuplicateNativeToolsAgent, session_id="sess-native-transient",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=AlwaysTransientNativeTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    # Bounded: three consecutive transient failures, then the one editable text bubble.
+    assert len(adapter.native_updates) == 3
+    assert len(adapter.sent) == 1
+    assert {edit["message_id"] for edit in adapter.edits} <= {"progress-1"}
+    last = (adapter.edits[-1] if adapter.edits else adapter.sent[0])["content"]
+    assert "Searching the web for alpha - done" in last
     assert adapter.native_stops == 1
 
 
@@ -2176,3 +2294,60 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="evt-trigger-001",
             reply_in_thread=True,
         ) == "evt-trigger-001"
+
+
+@pytest.mark.asyncio
+async def test_slack_card_backoff_holds_queued_events(monkeypatch, tmp_path):
+    """Review: events queued during the backoff must wait for the due resend, not retry at once."""
+    adapter, result = await _run_with_agent(  # default 2 s backoff, events 0.15 s apart
+        monkeypatch, tmp_path, DuplicateNativeToolsAgent, session_id="sess-native-backoff",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=AlwaysTransientNativeTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+    assert result["final_response"] == "done"
+    # Frame 1 fails; the queued events wait out the backoff; the closing flush is the only retry.
+    assert len(adapter.native_updates) == 2
+    assert adapter.sent == [] and adapter.edits == []  # no text bubble opened while closing
+
+
+@pytest.mark.asyncio
+async def test_slack_live_card_never_gets_a_text_bubble_beside_it(monkeypatch, tmp_path):
+    """Review: after the card was shown, a permanent failure freezes it instead of adding text."""
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, DuplicateNativeToolsAgent, session_id="sess-native-live-perm",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=LiveThenPermanentFailTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+    assert result["final_response"] == "done"
+    assert len(adapter.native_updates) == 2  # shown, one failed frame, then frozen
+    assert adapter.sent == [] and adapter.edits == []
+    assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_live_card_keeps_retrying_transient_failures(monkeypatch, tmp_path):
+    _fast_card_backoff(monkeypatch)
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, DuplicateNativeToolsAgent, session_id="sess-native-live-transient",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=LiveThenAlwaysTransientTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+    assert result["final_response"] == "done"
+    assert len(adapter.native_updates) > 3  # past MAX_TRANSIENT: a visible card keeps retrying
+    assert adapter.sent == [] and adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_slack_cancelled_timer_resend_still_ends_on_the_final_state(monkeypatch, tmp_path):
+    """Review: a cancel during the timer resend must not skip the closing projection."""
+    _fast_card_backoff(monkeypatch, 0.1)
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, StartThenSlowAgent, session_id="sess-native-timer-cancel",
+        platform=Platform.SLACK, chat_id="C1", thread_id="thread-1",
+        adapter_cls=FailThenHangThenOkTaskCardAdapter, user_id="U1", scope_id="T1",
+    )
+    assert result["final_response"] == "done"
+    assert len(adapter.native_updates) >= 3
+    final = {task["title"]: task["status"] for task in adapter.native_updates[-1]["tasks"]}
+    assert final == {"Searching the web for alpha": "complete"}
+    assert adapter.sent == []
