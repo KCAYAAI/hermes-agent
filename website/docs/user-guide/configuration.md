@@ -3058,6 +3058,7 @@ Secret redaction and the website blocklist:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
+  redact_phones: true            # Redact phone numbers separately from secrets (set false to keep phone numbers visible)
   website_blocklist:             # See Website Blocklist section below
     enabled: false
     domains: []
