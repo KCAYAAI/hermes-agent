@@ -2099,6 +2099,12 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
+        # The one message a person sees when a restart cut their messaging turn and it cannot
+        # continue on its own (gateway/session_restart_recovery.py). The second line is appended
+        # only when some steps may not have finished; {steps} becomes their names.
+        "restart_recovery_notice": ("♻️ I got restarted before I finished this. "
+                                    "Reply \"continue\" and I'll pick it up."),
+        "restart_recovery_notice_steps": "I'll check first whether these steps already ran: {steps}.",
         # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
         # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
         # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
