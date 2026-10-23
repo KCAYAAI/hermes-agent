@@ -2165,6 +2165,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     # cancel instead of reporting a retryable failure that keeps the loop alive.
                     raise asyncio.CancelledError() from exc
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
+                if not stream.stream_ts:
+                    # startStream may have been accepted before the answer was lost (the SDK can also
+                    # retry connection errors internally), so a retry could open a second card. Not
+                    # retryable: the turn takes the text lane, as before. appendStream frames carry
+                    # the full projection, so retrying those is safe.
+                    return SendResult(success=False, error=f"startStream outcome unknown: {exc}",
+                                      retryable=False)
                 return SendResult(success=False, error=str(exc), retryable=True)
 
     async def _start_task_card(self, client, stream: _NativeTaskCardStream, metadata) -> bool:
@@ -3283,7 +3290,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         thread_ts = self._resolve_thread_ts(None, metadata)
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
-        delivered = False
+        delivered = partial = False
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -3295,7 +3302,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     sent = await self.send(chat_id, f"{alt_text}\n{image_url}" if alt_text else image_url,
                                            metadata=metadata)
                     delivered = delivered or sent.success
+                    partial = partial or not sent.success  # the link was all that was left of this image
                     retry.remove((image_url, alt_text))
+                if len(file_uploads) + len(refused) < len(chunk):
+                    partial = True  # some images could not be read and left no link (missing local file)
                 if not file_uploads:
                     continue
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
@@ -3313,6 +3323,9 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     chunk_idx + 1, len(chunks), e, exc_info=True)
                 fallback = await super().send_multiple_images(chat_id, retry, metadata, human_delay=human_delay)
                 delivered = delivered or fallback.success
+                partial = partial or not fallback.success or fallback.error_kind == "partial"
+        if delivered and partial:
+            return SendResult(success=True, error="some images failed to send", error_kind="partial")
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     def _record_uploaded_file_thread(
