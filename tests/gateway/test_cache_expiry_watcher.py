@@ -15,6 +15,8 @@ from gateway.config import GatewayConfig
 from gateway.session import SessionEntry, SessionSource
 from gateway.config import Platform
 from gateway.session_authority import LiveSession
+from tests.fixtures.storage_seed import seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 from tests.waiting import async_wait_until
 
 HISTORY = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(6)]
@@ -65,15 +67,20 @@ class _Edge:
 
 
 class _Authority:
-    def __init__(self, runner):
+    """The authority surface the watcher reads, over a real admission store: the FIFO's claim is a
+    durable ``started`` row, as in production."""
+
+    def __init__(self, runner, persistence):
         self.runner, self.sessions, self.profile_id = runner, {}, "default"
+        self.persistence = persistence
+        self.epoch = persistence.runtime.begin_epoch(instance_id="t")
 
     def logical_owner(self, session_id):
         return session_id
 
 
 @pytest.fixture
-def make_runner(monkeypatch):
+def make_runner(monkeypatch, tmp_path):
     from gateway.run import GatewayRunner
 
     runners = []
@@ -82,7 +89,14 @@ def make_runner(monkeypatch):
         runner = object.__new__(GatewayRunner)
         runner.config = GatewayConfig()
         runner.session_store = _Store(entries)
-        runner.session_authority = _Authority(runner) if authority else None
+        if authority:
+            (home := tmp_path / f"home{len(runners)}").mkdir()
+            db = storage_handle(home)
+            for session_id in {entry.session_id for entry in entries.values()} | {k.rsplit(":", 1)[-1] for k in keys}:
+                seed_session(db, session_id, "telegram")
+            runner.session_authority = _Authority(runner, db)
+        else:
+            runner.session_authority = None
         runner._agent_cache = {key: (SimpleNamespace(session_id=entries[key].session_id if key in entries
                                                      else key.rsplit(":", 1)[-1], _prompt_cache_warmer=_Edge()),
                                      "sig") for key in keys}
@@ -145,8 +159,15 @@ async def test_a_turn_claim_waits_for_the_compaction_holding_the_claim_gate(make
     scan = asyncio.create_task(runner._compact_idle_sessions_before_cache_expiry())
     await async_wait_until(lambda: order == ["summary started"], timeout=5)
 
+    authority = runner.session_authority
+    db = authority.persistence
+    # A person's input is queued (not claimed): it does not stop the summary, it waits behind it.
+    db.admissions.admit(epoch=authority.epoch, principal_id="u1", session_id="s1", request_id="r1",
+                        payload={"text": "hi"})
+
     async def claim():
         async with live.claim_gate:
+            await asyncio.to_thread(db.admissions.claim, epoch=authority.epoch, session_id="s1")
             order.append("turn claimed")
     claimer = asyncio.create_task(claim())
     await asyncio.sleep(0)
@@ -155,6 +176,95 @@ async def test_a_turn_claim_waits_for_the_compaction_holding_the_claim_gate(make
     await asyncio.wait_for(claimer, timeout=5)
     assert order == ["summary started", "summary committed", "turn claimed"]
     await asyncio.wait_for(scan, timeout=5)
+
+
+def _record_cache_edge_work(runner, monkeypatch):
+    """Every summary or cold offload the watcher would commit, by action."""
+    import agent.turn_proactive_prune as prune
+    done = []
+
+    async def compress(source, entry, history, request, *, trigger=None):
+        done.append(("compact", entry.session_id))
+
+    def offload(live_agent, history, session_id):
+        done.append(("offload", session_id))
+        return history
+    runner._run_manual_compression = compress
+    monkeypatch.setattr(prune, "offload_cold_history", offload)
+    return done
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["started", "unknown"])
+@pytest.mark.parametrize("action", ["compact", "offload"])
+async def test_a_turn_claimed_before_the_watcher_takes_the_gate_is_not_compacted_under(make_runner, monkeypatch,
+                                                                                         action, status):
+    """Claim first: the FIFO wins ``claim_gate``, commits the claim (its transcript mark) and releases
+    the gate; the execution then waits in the multiplex ``_execution_scope`` before the runner installs
+    its pending-agent sentinel. The watcher's gate is free and the runner reads idle, but a summary or
+    offload written now lands after the mark and restart recovery reads it as the turn's own output
+    (an ``unknown`` admission is the same turn after a crash). The owner's admission says the turn is
+    live: the watcher writes nothing."""
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"], authority=True)
+    authority = runner.session_authority
+    db = authority.persistence
+    live = authority.sessions["s1"] = LiveSession(_source(), "k1")
+    runner._agent_cache["k1"][0]._prompt_cache_warmer.action = action
+    done = _record_cache_edge_work(runner, monkeypatch)
+    row, _ = db.admissions.admit(epoch=authority.epoch, principal_id="u1", session_id="s1", request_id="r1",
+                                 payload={"text": "hi"})
+    async with live.claim_gate:  # the FIFO's claim, as ``_claim_next`` commits it
+        claimed = await asyncio.to_thread(db.admissions.claim, epoch=authority.epoch, session_id="s1")
+    assert claimed and claimed.admission_id == row.admission_id
+    if status == "unknown":  # the process died with the claim started; the next boot fences it
+        db.admissions.recover(epoch=db.runtime.begin_epoch(instance_id="t2"))
+    assert [r.status for r in db.admissions.list(session_id="s1")] == [status]
+    assert not runner._is_session_running("k1")  # no runner sentinel yet: the scan claims the edge
+
+    await _compact_and_settle(runner)
+
+    assert done == []
+    assert not live.claim_gate.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["compact", "offload"])
+async def test_an_authority_chat_whose_live_gate_is_absent_is_not_worked_ungated(make_runner, monkeypatch, action):
+    """Under an authority the FIFO claim is serialized only by the live session's ``claim_gate``: with
+    no live entry to hold, a claim could land mid-summary, so the job does nothing rather than run
+    ungated."""
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"], authority=True)
+    runner._agent_cache["k1"][0]._prompt_cache_warmer.action = action
+    done = _record_cache_edge_work(runner, monkeypatch)
+
+    await _compact_and_settle(runner)
+
+    assert done == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["compact", "offload"])
+async def test_an_idle_authority_chat_with_only_settled_or_queued_input_is_still_worked(make_runner, monkeypatch,
+                                                                                         action):
+    """The guard reads the owner's started/unknown rows only: a settled earlier turn, or input still
+    queued behind the gate (it is claimed after the summary commits), leaves the edge work running."""
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"], authority=True)
+    authority = runner.session_authority
+    db = authority.persistence
+    authority.sessions["s1"] = LiveSession(_source(), "k1")
+    runner._agent_cache["k1"][0]._prompt_cache_warmer.action = action
+    done = _record_cache_edge_work(runner, monkeypatch)
+    db.admissions.admit(epoch=authority.epoch, principal_id="u1", session_id="s1", request_id="r0",
+                        payload={"text": "earlier"})
+    earlier = db.admissions.claim(epoch=authority.epoch, session_id="s1")
+    db.admissions.settle(epoch=authority.epoch, admission_id=earlier.admission_id, generation=earlier.generation,
+                         outcome="completed", result={"final_response": "ok", "messages": []})
+    db.admissions.admit(epoch=authority.epoch, principal_id="u1", session_id="s1", request_id="r1",
+                        payload={"text": "next"})
+
+    await _compact_and_settle(runner)
+
+    assert done == [(action, "s1")]
 
 
 @pytest.mark.asyncio
@@ -297,3 +407,126 @@ async def test_cold_claim_offloads_instead_of_requesting_a_summary(make_runner, 
     await _compact_and_settle(runner)
     assert offloads == [(True, True, "s1")]
     assert runner.compacted == []
+
+
+@pytest.mark.asyncio
+async def test_profile_retirement_joins_a_cache_edge_job_holding_the_old_gate(make_runner):
+    """A summary runs under the retiring authority's ``claim_gate``; a successor authority's claim
+    takes a different gate. Retirement joins the authority's tracked work (``join_authority_work``),
+    so the job is that work: the profile is released only after its write, or kept (missed join)."""
+    from gateway.session_runtime_workers import mutation_tasks
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"], authority=True)
+    authority = runner.session_authority
+    authority.sessions["s1"] = LiveSession(_source(), "k1")
+    release, order = asyncio.Event(), []
+
+    async def compress(source, entry, history, request, *, trigger=None):
+        order.append("summary started")
+        await release.wait()
+        order.append("summary committed")
+    runner._run_manual_compression = compress
+
+    await runner._compact_idle_sessions_before_cache_expiry()
+    await async_wait_until(lambda: order == ["summary started"], timeout=5)
+    assert len(mutation_tasks(authority)) == 1  # retirement's join waits for it
+    release.set()
+    await asyncio.gather(*getattr(runner, "_background_tasks", ()), return_exceptions=True)
+    assert order == ["summary started", "summary committed"]
+    assert mutation_tasks(authority) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("when", ["before_the_job", "while_the_route_resolves"])
+@pytest.mark.parametrize("action", ["compact", "offload"])
+async def test_a_retiring_authority_starts_no_cache_edge_work(make_runner, monkeypatch, action, when):
+    """Retirement sets ``retiring`` before it joins the authority's work: a job that has not
+    registered as that work by then (it may still be resolving its route in a thread) writes nothing,
+    since the join would not wait for it and a successor's claim could land under it."""
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"], authority=True)
+    authority = runner.session_authority
+    authority.sessions["s1"] = LiveSession(_source(), "k1")
+    runner._agent_cache["k1"][0]._prompt_cache_warmer.action = action
+    done = _record_cache_edge_work(runner, monkeypatch)
+    if when == "before_the_job":
+        authority.retiring = True
+    else:
+        resolve = runner._cache_expiry_route
+
+        def route_then_retire(key):
+            routed = resolve(key)
+            authority.retiring = True
+            return routed
+        runner._cache_expiry_route = route_then_retire
+
+    await _compact_and_settle(runner)
+
+    assert done == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["compact", "offload"])
+async def test_a_multiplex_key_with_no_serving_authority_is_not_worked_ungated(make_runner, monkeypatch, action):
+    """Under a multiplex registry a key whose profile no authority serves (unserved, or retiring and
+    filtered out of ``serving()``) has no claim gate to hold: the job does nothing rather than take
+    the standalone, ungated path."""
+    runner = make_runner({"k1": _entry("k1", "s1", _source())}, ["k1"])
+    runner.session_authorities = SimpleNamespace(serving=list, launch_key="launch")
+    runner._agent_cache["k1"][0]._prompt_cache_warmer.action = action
+    done = _record_cache_edge_work(runner, monkeypatch)
+
+    await _compact_and_settle(runner)
+
+    assert done == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_re_serve_is_not_recorded_as_served(tmp_path, monkeypatch):
+    """A hot re-serve refused because retirement still holds ownership (a cache-edge summary is
+    still running) must not record the profile as served: otherwise no adapter starts, the serve
+    verb reports success, and later scans and serves see it as "already served" (Astra, r32 p13)."""
+    from pathlib import Path
+    from gateway import run
+    from gateway.run import GatewayRunner
+    from gateway.runtime_ownership import process_ownership
+
+    monkeypatch.setattr(run, "_load_gateway_config", lambda *a: {
+        "platform_toolsets": {"cli": [], "tui": []},
+        "model": {"provider": "custom", "base_url": "http://127.0.0.1:9/v1", "api_key": "test-key"}})
+    root = tmp_path / ".hermes"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    beta = root / "profiles" / "beta"
+    beta.mkdir(parents=True, mode=0o700)
+    (beta / "config.yaml").write_text("{}")
+    config = GatewayConfig()
+    config.multiplex_profiles = True
+    config._runtime_profile_homes = (("default", root),)
+    runner = GatewayRunner(config)
+    process_ownership.reserve([root])
+    try:
+        started = []
+
+        async def refuse(name, home):
+            return f"profile '{name}' ownership retained: retirement is still joining its work"
+
+        async def start_adapters(name, home, claimed):
+            started.append(name)
+            return 1
+
+        async def nothing(*_a, **_k):
+            return None
+
+        monkeypatch.setattr(runner, "_serve_profile_runtime", refuse)
+        monkeypatch.setattr(runner, "_start_one_profile_adapters", start_adapters)
+        monkeypatch.setattr(runner, "_after_profiles_added", nothing)
+        known = dict(runner._served_profile_homes or {})
+        known["beta"] = beta.resolve()  # what the serve control verb passes
+        result = await runner._apply_profile_changes(known, ["beta"], [], [], reason="control-socket")
+
+        assert started == []
+        assert result["parked"] == ["beta"]
+        assert "beta" not in result["served_profiles"]
+        assert "beta" not in (runner._served_profile_homes or {})
+    finally:
+        process_ownership.release(root)

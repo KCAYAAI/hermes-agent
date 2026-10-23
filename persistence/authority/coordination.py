@@ -593,6 +593,10 @@ class CoordinationRepository(SubagentLedger, Protocol):
         """Insert-or-ignore an unowned ``attempting`` row unless a row with this session key and content was created at or after ``since``."""
         ...
 
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, owner: OwnerStamp) -> bool:
+        """Insert-or-ignore an ``attempting`` row with 1 attempt stamped to ``owner`` (the saved answer of a person's turn restart recovery settled) unless a row with this session key and content was created at or after ``since``; True when inserted. A ledgered row (any state) is never re-owned."""
+        ...
+
     def mark_obligation_attempting(self, *, obligation_id: str) -> None:
         """State ``attempting``, ``updated_at`` now, error cleared."""
         ...

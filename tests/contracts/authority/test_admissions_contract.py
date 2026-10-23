@@ -318,6 +318,93 @@ def test_list_unknown_reports_recovered_unknown_work(backend, scope_a):
     assert [r.admission_id for r in store_a.admissions.list(session_id=SESSION)] == [admitted.admission_id, queued.admission_id]
 
 
+def _lose_head(backend, scope, epoch, admission_id) -> tuple[AuthorityEpoch, int]:
+    """Claim the FIFO head under ``epoch``, then a successor epoch's boot recovery marks it unknown."""
+    store = backend.open(scope)
+    assert store.admissions.claim(epoch=epoch, session_id=SESSION).admission_id == admission_id
+    successor = _begin_epoch(backend, scope)
+    store.admissions.recover(epoch=successor)
+    lost = store.admissions.get(admission_id=admission_id)
+    assert lost.status == AdmissionStatus.UNKNOWN
+    return successor, lost.generation
+
+
+def test_recover_unknown_requeues_in_place_then_settles_with_an_owed_answer(backend, scope_a):
+    store_a = backend.open(scope_a)
+    _require(backend)
+    epoch = _seed(backend, scope_a)
+    admitted = _admit(backend, scope_a, epoch, request_id="req-lost", payload={"text": "hello"})
+    epoch, generation = _lose_head(backend, scope_a, epoch, admitted.admission_id)
+    record, recovered = store_a.admissions.recover_unknown(epoch=epoch, admission_id=admitted.admission_id,
+                                                           generation=generation, action="requeue")
+    # CONTRACT: requeue puts the lost row back in its own FIFO place and counts the automatic rerun.
+    assert recovered is True and record.status == AdmissionStatus.QUEUED
+    assert record.seq == admitted.seq and record.generation is None
+    assert store_a.admissions.recovery_attempts(admission_id=admitted.admission_id) == 1
+    # CONTRACT: a retry of a recovery that already committed changes nothing and says so.
+    again, recovered = store_a.admissions.recover_unknown(epoch=epoch, admission_id=admitted.admission_id,
+                                                          generation=generation, action="requeue")
+    assert recovered is False and again.status == AdmissionStatus.QUEUED
+    assert store_a.admissions.recovery_attempts(admission_id=admitted.admission_id) == 1
+    epoch, generation = _lose_head(backend, scope_a, epoch, admitted.admission_id)
+    with pytest.raises(AuthorityRefusal):  # completed needs the captured result
+        store_a.admissions.recover_unknown(epoch=epoch, admission_id=admitted.admission_id, generation=generation,
+                                           action="completed")
+    from persistence.authority.admissions import CapturedResult
+    captured = CapturedResult("completed", {"result": {"final_response": "ANSWER", "messages": []}, "usage": {}})
+    record, recovered = store_a.admissions.recover_unknown(
+        epoch=epoch, admission_id=admitted.admission_id, generation=generation, action="completed",
+        captured=captured, owed="OWED")
+    # CONTRACT: completed commits the captured result and the owed answer with the terminal transition.
+    assert recovered is True and (record.status, record.outcome) == (AdmissionStatus.TERMINAL, "completed")
+    assert store_a.admissions.settled_result(admission_id=admitted.admission_id).result is not None
+    assert store_a.admissions.owed_recovery_answers() == [(admitted.admission_id, "OWED")]
+    store_a.admissions.clear_recovery_owed(admission_id=admitted.admission_id)
+    assert store_a.admissions.owed_recovery_answers() == []
+    # CONTRACT: the restart notice is claimed once.
+    assert store_a.admissions.claim_recovery_notice(admission_id=admitted.admission_id) is True
+    assert store_a.admissions.claim_recovery_notice(admission_id=admitted.admission_id) is False
+
+
+def test_lost_turn_transcript_reads_the_rows_after_the_anchor(backend, scope_a):
+    from persistence.conversation.messages import NewMessage
+    store_a = backend.open(scope_a)
+    _require(backend)
+    _seed(backend, scope_a)
+    call = {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+    store_a.messages.append(SESSION, NewMessage(role="user", content="earlier", timestamp=100.0))
+    store_a.messages.append(SESSION, NewMessage(role="user", content="lost", timestamp=200.0, platform_message_id="e1"))
+    store_a.messages.append(SESSION, NewMessage(role="assistant", content=None, timestamp=201.0, tool_calls=(call,)))
+    saved = store_a.admissions.lost_turn_transcript(session_id=SESSION, event_id="e1", since=None)
+    # CONTRACT: anchored on the turn's own user row, the rows after it in order.
+    assert saved.anchored and saved.anchor_timestamp == 200.0
+    assert [(row.role, row.active, json.loads(row.tool_calls)[0]["function"]["name"]) for row in saved.rows] == [("assistant", True, "terminal")]
+    # CONTRACT: unanchored, whether a reply or step was saved since the given time.
+    assert store_a.admissions.lost_turn_transcript(session_id=SESSION, event_id="other", since=150.0).ran_since is True
+    unanchored = store_a.admissions.lost_turn_transcript(session_id=SESSION, event_id=None, since=300.0)
+    assert not unanchored.anchored and unanchored.ran_since is False and unanchored.rows == ()
+
+
+def test_lost_turn_transcript_ignores_rows_saved_before_the_claim(backend, scope_a):
+    from persistence.conversation.messages import NewMessage
+    store_a = backend.open(scope_a)
+    _require(backend)
+    epoch = _seed(backend, scope_a)
+    admitted = _admit(backend, scope_a, epoch, request_id="req-mark")
+    store_a.messages.append(SESSION, NewMessage(role="assistant", content="summary", timestamp=500.0))
+    claimed = store_a.admissions.claim(epoch=epoch, session_id=SESSION)
+    assert claimed is not None and claimed.admission_id == admitted.admission_id
+    # CONTRACT: unanchored with the claim's admission, a row saved before the claim is not the turn running.
+    assert store_a.admissions.lost_turn_transcript(
+        session_id=SESSION, event_id=None, since=400.0, admission_id=admitted.admission_id).ran_since is False
+    # Without the admission the read keeps its time-only answer.
+    assert store_a.admissions.lost_turn_transcript(session_id=SESSION, event_id=None, since=400.0).ran_since is True
+    # CONTRACT: a row saved after the claim still counts.
+    store_a.messages.append(SESSION, NewMessage(role="tool", content="ok", timestamp=501.0, tool_call_id="c1"))
+    assert store_a.admissions.lost_turn_transcript(
+        session_id=SESSION, event_id=None, since=400.0, admission_id=admitted.admission_id).ran_since is True
+
+
 def test_live_reads_do_not_see_retired_rows_that_get_still_answers(backend, scope_a):
     store_a = backend.open(scope_a)
     _require(backend)

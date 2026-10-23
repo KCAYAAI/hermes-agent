@@ -17,6 +17,8 @@ from persistence.authority.admissions import (
     CapturedResult,
     AdmissionGate,
     ClaimedAdmission,
+    LostTurnRow,
+    LostTurnTranscript,
     QueuedFold,
     QueuedReplacement,
     TranscriptRewrite,
@@ -136,6 +138,32 @@ class SQLiteAdmissionRepository:
                 self._store.holder(), epoch=epoch, admission_id=admission_id, generation=generation, notice=notice,
                 _captured=None if captured is None else (captured.outcome, dict(captured.result))))
 
+    def recover_unknown(self, *, epoch: int, admission_id: str, generation: int,
+                        action: Literal["completed", "requeue", "interrupted"], notice: str | None = None,
+                        captured: CapturedResult | None = None, owed: str | None = None) -> tuple[AdmissionRecord, bool]:
+        with refused():
+            row, recovered = store.recover_unknown_session_input(
+                self._store.holder(), epoch=epoch, admission_id=admission_id, generation=generation, action=action,
+                notice=notice, owed=owed,
+                _captured=None if captured is None else (captured.outcome, dict(captured.result)))
+        return _record(row), recovered
+
+    def recovery_attempts(self, *, admission_id: str) -> int:
+        with refused():
+            return store.recovery_attempts(self._store.holder(), admission_id=admission_id)
+
+    def claim_recovery_notice(self, *, admission_id: str) -> bool:
+        with refused():
+            return store.claim_recovery_notice(self._store.holder(), admission_id=admission_id)
+
+    def owed_recovery_answers(self) -> list[tuple[str, str]]:
+        with refused():
+            return store.owed_recovery_answers(self._store.holder())
+
+    def clear_recovery_owed(self, *, admission_id: str) -> None:
+        with refused():
+            store.clear_recovery_owed(self._store.holder(), admission_id=admission_id)
+
     def compact_api_payloads(self, *, admission_ids: Sequence[str]) -> int:
         with refused():
             return owner.compact_api_payloads(self._store.holder(), list(admission_ids))
@@ -213,6 +241,14 @@ class SQLiteAdmissionRepository:
     def list_unknown(self) -> list[AdmissionRecord]:
         with refused():
             return [_record(row) for row in owner.list_unknown(self._store.holder())]
+
+    def lost_turn_transcript(self, *, session_id: str, event_id: str | None, since: float | None,
+                             admission_id: str | None = None) -> LostTurnTranscript:
+        with refused():
+            found = store.lost_turn_transcript(self._store.holder(), session_id=session_id, event_id=event_id,
+                                               since=since, admission_id=admission_id)
+        return LostTurnTranscript(anchored=found["anchored"], anchor_timestamp=found["anchor_timestamp"],
+                                  ran_since=found["ran_since"], rows=tuple(LostTurnRow(**row) for row in found["rows"]))
 
     def has_pending(self, *, session_ids: Sequence[str] = (), statuses: frozenset[str] | None = None) -> bool:
         with refused():
