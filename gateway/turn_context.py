@@ -7,6 +7,8 @@ single-element lists so mutation stays visible to the outer body.
 
 from __future__ import annotations
 
+import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -105,5 +107,9 @@ class TurnContext:
     # callbacks are published by TurnRunner (like voice_ack_callback above) so tool starts and completions
     # correlate by real tool-call ID instead of tool name.
     _native_slack_task_cards: bool = False
+    # Set once turn cleanup begins: progress rails stop publishing and open no new text fallback.
+    _progress_stop: threading.Event = field(default_factory=threading.Event)
+    # Owns this turn's native progress card: an old turn's late stop can never close a newer card.
+    _progress_owner: str = field(default_factory=lambda: uuid.uuid4().hex)
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
