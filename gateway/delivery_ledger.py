@@ -307,6 +307,30 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
              session_key, content, since))
 
 
+def record_recovered_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                           thread_id: Optional[str], content: str, since: float,
+                           adapter_profile: Optional[str] = None) -> bool:
+    """Ledger the saved answer of a person's turn lost across a restart (session restart recovery),
+    owned by THIS process and 'attempting' (a streamed part may be on screen: it goes out once, with
+    the recovered marker). True when inserted: the caller sends it. False when this id or the same
+    reply for this conversation since *since* is already ledgered (in any state): that row, and the
+    sweeps that own it, deliver it; a row is never re-owned, so a sweep mid-send is never doubled."""
+    now, (pid, started) = time.time(), _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, adapter_profile)
+               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 1, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
+                                 WHERE session_key = ? AND content = ? AND created_at >= ?)""",
+            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+             session_key, content, since))
+        return cursor.rowcount == 1
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
