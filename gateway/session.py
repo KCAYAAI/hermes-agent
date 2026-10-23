@@ -1167,7 +1167,18 @@ class SessionStore(
         Internal bookkeeping must not advance the user-activity clock used by housekeeping
         and restart recovery.
         """
-        return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
+        # Metadata-only: the key -> session_id mapping is unchanged, so persist ONE row
+        # (single-entry UPSERT; it falls back to the full rewrite itself). A full rewrite here ran
+        # on the event loop for every Slack thread message (~0.6 s at 11k routing entries).
+        # Same shape as the lightweight metadata update above: mutate under ``_lock``, save after
+        # releasing it (the fallback full rewrite takes ``_lock`` itself).
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            entry.metadata[key] = value
+        self._save_entry(session_key)
+        return True
 
     def set_model_override(self, session_key: str, override: Optional[dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
