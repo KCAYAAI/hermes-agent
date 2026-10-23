@@ -171,3 +171,33 @@ def policy_for_runner_source(runner: Any, source: Any) -> SlashAccessPolicy:
         if config is None:
             return _FAIL_CLOSED_POLICY
     return policy_for_source(config, source)
+
+
+def platform_extra_for_runner_source(runner: Any, source: Any) -> dict:
+    """KC: the ``extra`` dict of the platform config owned by the profile whose bot received
+    ``source`` (same owner resolution as :func:`policy_for_runner_source`); ``{}`` when unknown."""
+    config = getattr(runner, "config", None)
+    if source is None:
+        return {}
+    if getattr(config, "multiplex_profiles", False):
+        from gateway.session_identity import identity_of
+
+        identity = identity_of(source)
+        owner = identity.transport_profile if identity is not None else getattr(source, "profile", None)
+        primary = getattr(runner, "_primary_profile_name", None) or "default"
+        if owner and owner != primary:
+            config = (getattr(runner, "_profile_configs", None) or {}).get(owner)
+    if config is None:
+        return {}
+    platforms = getattr(config, "platforms", None)
+    platform_config = None
+    if platforms is not None:
+        try:
+            platform_config = platforms.get(source.platform)
+        except Exception:
+            platform_config = None
+    extra = getattr(platform_config, "extra", None)
+    if not isinstance(extra, dict):
+        extra = platform_config if isinstance(platform_config, dict) else {}
+    return extra
+
