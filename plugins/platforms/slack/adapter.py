@@ -356,6 +356,9 @@ class _NativeTaskCardStream:
     stream_ts: str = ""
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # The turn that opened this card. An owner-scoped stop/abandon from any other turn is a no-op,
+    # so a late finalizer from an old turn never closes a newer turn's card in the same thread.
+    owner: str = ""
 
 
 def check_slack_requirements() -> bool:
@@ -2103,7 +2106,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def send_native_task_card_progress(
         self, chat_id: str, tasks: list[dict[str, str]], *, title: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
-        fallback_text: Optional[str] = None) -> SendResult:
+        fallback_text: Optional[str] = None, owner: Optional[str] = None) -> SendResult:
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
@@ -2115,7 +2118,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="No Slack thread target")
         stream = self._native_task_card_streams.get(key)
         if stream is None or stream.stopped:
-            stream = _NativeTaskCardStream(team_id=key[0], channel=chat_id, thread_ts=key[2])
+            stream = _NativeTaskCardStream(team_id=key[0], channel=chat_id, thread_ts=key[2], owner=owner or "")
             # No await between lookup and assignment, so racers share this lock.
             self._native_task_card_streams[key] = stream
         async with stream.lock:
@@ -2155,6 +2158,12 @@ class SlackAdapter(BasePlatformAdapter):
                     await self._delete_sealed_task_card(client, chat_id, sealed_ts)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
+                _task = asyncio.current_task()
+                if _task is not None and _task.cancelling():
+                    # Turn cleanup cancelled this update and the transport converted the cancel
+                    # into an ordinary error (aiohttp: CancelledError -> TimeoutError). Honour the
+                    # cancel instead of reporting a retryable failure that keeps the loop alive.
+                    raise asyncio.CancelledError() from exc
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), retryable=True)
 
@@ -2226,14 +2235,35 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None) -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> None:
+        """Finalize an active Slack-native progress stream exactly once.
+
+        With ``owner``, only the turn that opened the card may finalize it."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
             return
         stream = self._native_task_card_streams.get(key)
-        if stream is not None:
-            await self._stop_native_task_card_stream(key, stream)
+        if stream is None:
+            return
+        if owner and stream.owner and stream.owner != owner:
+            logger.debug("[Slack] Ignoring task-card stop from a turn that does not own card %s",
+                         stream.stream_ts)
+            return
+        await self._stop_native_task_card_stream(key, stream)
+
+    def abandon_native_task_card_progress(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> None:
+        """Retire this turn's card stream WITHOUT network I/O (its updater is stuck). The next
+        turn in the thread opens a fresh card instead of queueing behind the stuck lock."""
+        key = self._native_task_card_key(chat_id, reply_to, metadata)
+        if key is None:
+            return
+        stream = self._native_task_card_streams.get(key)
+        if stream is None or (owner and stream.owner and stream.owner != owner):
+            return
+        stream.stopped = True
+        self._native_task_card_streams.pop(key, None)
 
     def _suppressed_ignored(self, chat_id: str, what: str, *, level: int = logging.WARNING) -> bool:
         """True (after logging) when ``chat_id`` is a configured ignored channel."""
