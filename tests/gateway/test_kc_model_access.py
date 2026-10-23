@@ -253,3 +253,48 @@ async def test_telegram_unaffected(monkeypatch):
         _event("/reasoning high --global", platform=Platform.TELEGRAM, chat_type="dm"))
     assert "⛔" not in reply
     assert saved == [("agent.reasoning_effort", "high")]
+
+
+# ------------------------------------------------------------- usage-limit one-tap switch (KC gate)
+
+
+def _usage_limit_runner(monkeypatch, runner):
+    from gateway import slash_commands_model as scm
+    from unittest.mock import AsyncMock
+    runner._normalize_source_for_session_key = lambda source: source
+    seen = {"perform": 0, "commit": 0, "tasks": []}
+
+    async def _perform(ctx, target, provider, source):
+        seen["perform"] += 1
+        return SimpleNamespace(new_model=target, target_provider=provider), None
+
+    async def _commit(result, ctx, *, source, picker):
+        seen["commit"] += 1
+        runner._session_model_overrides[ctx.session_key] = {"model": result.new_model, "provider": "nous"}
+        return "✓ switched"
+
+    runner._perform_model_switch = _perform
+    runner._commit_model_switch = _commit
+    runner._track_background_task = lambda coro: (seen["tasks"].append(coro), coro.close())
+    monkeypatch.setattr(scm._ModelSwitchContext, "read_config", lambda self: None)
+    monkeypatch.setattr(scm._ModelSwitchContext, "apply_override", lambda self, override: None)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_non_admin_usage_limit_switch_off_list_is_refused(monkeypatch):
+    runner = _runner()
+    seen = _usage_limit_runner(monkeypatch, runner)
+    reply = await runner._accept_usage_limit_switch(_event("x"), "example/model-free:free")
+    assert reply == access.not_curated_message(PICKER)
+    assert seen["commit"] == 0 and seen["tasks"] == []
+    assert runner._session_model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_admin_usage_limit_switch_still_works(monkeypatch):
+    runner = _runner()
+    seen = _usage_limit_runner(monkeypatch, runner)
+    reply = await runner._accept_usage_limit_switch(_event("x", user=ADMIN), "example/model-free:free")
+    assert reply == "✓ switched"
+    assert seen["commit"] == 1 and len(seen["tasks"]) == 1
