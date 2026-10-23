@@ -588,6 +588,17 @@ class GatewayModelCommandsMixin:
         request = parse_model_switch_args(event.get_command_args().strip())  # single-owner parser
         if request.errors:
             return f"❌ {request.error_messages()[0]}"  # gateway decoration over canonical copy
+        # KC: a non-admin Slack user changes only their own conversation, and only to a curated row.
+        from gateway import kc_model_access as _kc_access
+        _kc_restricted = _kc_access.restricted(self, event.source)
+        _kc_curated = _kc_access.curated_entries(self, event.source)
+        if _kc_restricted and request.is_global:
+            return _kc_access.GLOBAL_DENIED
+        _kc_target, _kc_provider = request.target, request.explicit_provider
+        _kc_label_entry = (
+            _kc_access.entry_for_label(_kc_curated, request.target) if not request.explicit_provider else None)
+        if _kc_label_entry is not None:  # `/model Sonnet 5.5` -> that row's exact provider + model
+            _kc_target, _kc_provider = _kc_label_entry["model"], _kc_label_entry["provider"]
         if request.force_refresh:  # bust the disk cache so the picker shows live data
             with contextlib.suppress(Exception):
                 from hermes_cli.models import clear_provider_models_cache
@@ -613,9 +624,9 @@ class GatewayModelCommandsMixin:
             session_key=session_key,
             source=source,
             config_path=(profile_home or _hermes_home) / "config.yaml",
-            persist_global=resolve_persist_behavior(
+            persist_global=(not _kc_restricted) and resolve_persist_behavior(
                 request.is_global, request.is_session, is_once=request.is_once,
-                explicit_provider=request.explicit_provider,
+                explicit_provider=_kc_provider,
             ),
             one_turn=request.is_once,
             reasoning_effort=request.reasoning_effort,
@@ -633,9 +644,14 @@ class GatewayModelCommandsMixin:
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)
-        result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
+        if _kc_restricted and _kc_curated and not request.target:
+            return _kc_access.not_curated_message(_kc_curated)  # bare `--provider`: no model chosen
+        result, error = await self._perform_model_switch(ctx, _kc_target, _kc_provider, source)
         if error is not None:
             return error
+        if _kc_restricted and _kc_curated and not _kc_access.is_curated_route(
+                _kc_curated, result.target_provider, result.new_model):
+            return _kc_access.not_curated_message(_kc_curated)
         guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)
         if guard_fired:
             return guard_reply
@@ -966,6 +982,13 @@ class GatewayModelCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
+        # KC: a non-admin Slack user sets reasoning for their own conversation only.
+        from gateway import kc_model_access as _kc_access
+        _kc_restricted = _kc_access.restricted(self, event.source)
+        if _kc_restricted and persist_global:
+            return _kc_access.GLOBAL_DENIED
+        if _kc_restricted and args in _kc_access.DISPLAY_TOGGLES:
+            return _kc_access.DISPLAY_DENIED
         # Normalize (Telegram DM topic recovery) so the override key matches the next turn's.
         # See #30479.
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
@@ -1012,6 +1035,8 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
+            if _kc_restricted and str(value or "").strip().lower() in _kc_access.DISPLAY_TOGGLES:
+                return _kc_access.DISPLAY_DENIED
             return self._apply_reasoning_selection(session_key, platform_key, value)
 
         picker_sent = await self._try_send_choice_picker(
@@ -1023,7 +1048,7 @@ class GatewayModelCommandsMixin:
                 *({"value": lv, "label": effort_display_label(lv, *_route), "is_current": lv == current_effort}
                   for lv in VALID_REASONING_EFFORTS),
                 *({"value": v, "label": t(f"gateway.reasoning.choice_{v}"), "is_current": False}
-                  for v in ("reset", "show", "hide")),
+                  for v in (("reset",) if _kc_restricted else ("reset", "show", "hide"))),
             ],
             on_choice_selected=_on_reasoning_choice,
         )
