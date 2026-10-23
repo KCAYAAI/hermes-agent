@@ -128,7 +128,7 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # MCP catalog trust root; package-manager wrappers may still set it in the process env.
     "HERMES_OPTIONAL_MCPS",
     # Security policy / approval-routing context — set via their dedicated controls only.
-    "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS",
+    "HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_REDACT_SECRETS", "HERMES_REDACT_PHONES",
     "HERMES_INTERACTIVE", "HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM"})
@@ -2283,6 +2283,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         _note_policy("note_config_policy", (expanded.get("security") or {}).get("redact_secrets"))
+        _note_policy("note_config_phones_policy", (expanded.get("security") or {}).get("redact_phones"))
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while
             # load_config_readonly() callers all see the same stable object. The env snapshot
@@ -2423,6 +2424,7 @@ def load_env() -> dict[str, str]:
 
     env = load_env_file(get_env_path())
     _note_policy("note_env_policy", env.get("HERMES_REDACT_SECRETS"))
+    _note_policy("note_env_phones_policy", env.get("HERMES_REDACT_PHONES"))
     return env
 
 
