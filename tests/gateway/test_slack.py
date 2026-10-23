@@ -6229,3 +6229,84 @@ class TestNativeTaskCardAmbiguousStart:
             "C1", [{"id": "c", "title": "t", "status": "in_progress"}], metadata={"thread_id": "th-1"})
         assert result.success is False and result.retryable is True
 
+
+
+class TestMultiImagePartialDelivery:
+    """Review round 3: a chunk's per-image fallback resends everything the chunk still owes, so a
+    full fallback recovery must clear that chunk's provisional collection loss. An image upstream
+    refuses to download goes out as its link: lost only when that link send fails too."""
+
+    @staticmethod
+    def _collect(monkeypatch, uploads, refused=()):
+        async def collect(chunk, *a):
+            return list(uploads), ["a"], list(refused)
+
+        monkeypatch.setattr(_slack_mod, "collect_image_uploads", collect)
+
+    @pytest.mark.asyncio
+    async def test_fallback_that_delivers_every_image_is_complete(self, adapter, monkeypatch):
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        self._collect(monkeypatch, [{"file": "/tmp/a.png"}])  # one of two images could be read
+        adapter._app.client.files_upload_v2 = AsyncMock(side_effect=RuntimeError("upload failed"))
+        monkeypatch.setattr(BasePlatformAdapter, "send_multiple_images",
+                            AsyncMock(return_value=SendResult(success=True)))
+        result = await adapter.send_multiple_images(
+            "C1", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+        assert result.success is True and result.error_kind is None
+
+    @pytest.mark.asyncio
+    async def test_uploaded_chunk_with_an_unreadable_image_is_partial(self, adapter, monkeypatch):
+        self._collect(monkeypatch, [{"file": "/tmp/a.png"}])
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+        result = await adapter.send_multiple_images(
+            "C1", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+        assert result.success is True and result.error_kind == "partial"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("link_sent", [True, False])
+    async def test_refused_image_is_lost_only_when_its_link_fails_too(self, adapter, monkeypatch, link_sent):
+        from gateway.platforms.base import SendResult
+
+        refused = ("https://example.com/b.png", "b")
+        self._collect(monkeypatch, [{"file": "/tmp/a.png"}], refused=[refused])
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+        sends = AsyncMock(return_value=SendResult(success=link_sent, error=None if link_sent else "channel_not_found"))
+        monkeypatch.setattr(adapter, "send", sends)
+        result = await adapter.send_multiple_images("C1", [("https://example.com/a.png", "a"), refused])
+        assert sends.await_args.args[1] == "b\nhttps://example.com/b.png"
+        assert result.success is True
+        assert result.error_kind == (None if link_sent else "partial")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("uploads", [[{"file": "/tmp/a.png"}], []])
+    async def test_missing_file_beside_a_linked_refused_image_is_partial(self, adapter, monkeypatch, uploads):
+        """A missing local file leaves no upload and no link: the batch is partial even when the
+        chunk's refused image went out as its link (with or without another upload)."""
+        from gateway.platforms.base import SendResult
+
+        refused = ("https://example.com/b.png", "b")
+        self._collect(monkeypatch, uploads, refused=[refused])
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+        monkeypatch.setattr(adapter, "send", AsyncMock(return_value=SendResult(success=True)))
+        chunk = [refused, ("/tmp/missing.png", "c")]
+        if uploads:
+            chunk.insert(0, ("https://example.com/a.png", "a"))
+        result = await adapter.send_multiple_images("C1", chunk)
+        assert result.success is True and result.error_kind == "partial"
+
+    @pytest.mark.asyncio
+    async def test_link_send_that_raises_leaves_the_image_to_the_fallback(self, adapter, monkeypatch):
+        """An exception while sending a refused image's link: that image is still owed, so the
+        per-image fallback gets it together with the rest of the chunk and decides the outcome."""
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        images = [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")]
+        self._collect(monkeypatch, [{"file": "/tmp/a.png"}], refused=[images[1]])
+        monkeypatch.setattr(adapter, "send", AsyncMock(side_effect=RuntimeError("socket closed")))
+        fallback = AsyncMock(return_value=SendResult(success=True))
+        monkeypatch.setattr(BasePlatformAdapter, "send_multiple_images", fallback)
+        result = await adapter.send_multiple_images("C1", images)
+        assert fallback.await_args.args[1] == images
+        assert result.success is True and result.error_kind is None
+
