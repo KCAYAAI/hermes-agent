@@ -238,6 +238,20 @@ def resolve_shutdown_watchdog_delay(
     return _coerce_float(drain_timeout, 0.0) + grace
 
 
+def _main_thread_stack() -> str:
+    """The main (event-loop) thread's stack as text; never raises."""
+    try:
+        import traceback
+        ident = threading.main_thread().ident
+        frame = sys._current_frames().get(ident) if ident is not None else None
+        if frame is None:
+            return "--- main thread: no frame ---\n"
+        return ("--- main thread (event loop) ---\n" + "".join(traceback.format_stack(frame))
+                + "--- end main thread ---\n")
+    except Exception as exc:  # diagnostics only
+        return f"--- main thread: stack unavailable ({type(exc).__name__}) ---\n"
+
+
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[dict[str, Any]],
                          event: str = "shutdown_watchdog_fired") -> None:
     """Best-effort faulthandler + metadata dump before hard-exit (file, then stderr)."""
@@ -246,7 +260,12 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
     with contextlib.suppress(OSError):  # unwritable dir: skip only the file copy, stderr still runs
         dump_path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(Exception), open(dump_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(header, default=str) + "\n--- faulthandler dump (all threads) ---\n")
+        fh.write(json.dumps(header, default=str) + "\n")
+        # faulthandler stops after 100 threads, newest first, so on a busy gateway the oldest thread
+        # (the main thread, which runs the event loop this watchdog is about) was never written.
+        # Write it first, on its own.
+        fh.write(_main_thread_stack())
+        fh.write("--- faulthandler dump (all threads) ---\n")
         fh.flush()
         try:
             faulthandler.dump_traceback(file=fh, all_threads=True)
@@ -257,6 +276,7 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
     with contextlib.suppress(Exception):  # stderr too: journald/launchd get it if disk is wedged
         sys.stderr.write(f"Gateway {event.replace('_', ' ')} after {delay_s:.0f}s "
                          f"(pid={os.getpid()}); dumping all thread stacks.\n")
+        sys.stderr.write(_main_thread_stack())
         sys.stderr.flush()
         faulthandler.dump_traceback(all_threads=True)
 
