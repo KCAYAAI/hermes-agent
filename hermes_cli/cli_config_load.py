@@ -172,6 +172,9 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
         redact = security_config.get("redact_secrets")
         if redact is not None:
             os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()
+        redact_phones = security_config.get("redact_phones")
+        if redact_phones is not None:
+            os.environ["HERMES_REDACT_PHONES"] = str(redact_phones).lower()
 
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
