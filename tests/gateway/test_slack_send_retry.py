@@ -118,7 +118,7 @@ class TestSlackSendRetryable:
         (#111931)."""
         adapter = _make_adapter()
         error = _slack_api_error(200)
-        error.response.data = {"ok": False, "error": "message_not_found"}
+        error.response.data = {"ok": False, "error": "cant_update_message"}
         client = AsyncMock()
         client.chat_update = AsyncMock(side_effect=error)
         adapter._get_client = lambda cid, team_id="": client
@@ -127,5 +127,22 @@ class TestSlackSendRetryable:
             result = await adapter.edit_message("C123", "123.456", "hello")
 
         assert result.success is False
+        assert "api_error=cant_update_message" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_edit_message_not_found_is_expected_not_an_error(self, caplog):
+        """A deleted target is expected after progress cleanup: name the code at INFO, never ERROR."""
+        adapter = _make_adapter()
+        error = _slack_api_error(200)
+        error.response.data = {"ok": False, "error": "message_not_found"}
+        client = AsyncMock()
+        client.chat_update = AsyncMock(side_effect=error)
+        adapter._get_client = lambda cid, team_id="": client
+
+        with caplog.at_level("INFO", logger="plugins.platforms.slack.adapter"):
+            result = await adapter.edit_message("C123", "123.456", "hello")
+
+        assert result.success is False
         assert "api_error=message_not_found" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
