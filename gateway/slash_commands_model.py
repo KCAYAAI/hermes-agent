@@ -798,6 +798,14 @@ class GatewayModelCommandsMixin:
             result, error = await self._perform_model_switch(ctx, model_id, "nous", event.source)
             if error is not None:
                 return error
+            # KC: the one-tap switch is a /model switch too; a non-admin Slack user may only land on
+            # a curated picker row (same gate as _handle_model_command_locked).
+            from gateway import kc_model_access as _kc_access
+            if result is not None and _kc_access.restricted(self, event.source):
+                curated = _kc_access.curated_entries(self, event.source)
+                if curated and not _kc_access.is_curated_route(
+                        curated, getattr(result, "target_provider", "nous"), result.new_model):
+                    return _kc_access.not_curated_message(curated)
             return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
 
         before = self._session_model_overrides.get(session_key)
