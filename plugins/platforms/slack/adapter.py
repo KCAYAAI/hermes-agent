@@ -2165,7 +2165,18 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             value = _first_truthy(md, sources)
             if value:
                 start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
+        try:
+            result = await client.api_call("chat.startStream", json=start_payload)
+        except Exception as exc:
+            if not (_slack_error_is(exc, "user_not_found") and start_payload.get("recipient_user_id")):
+                raise
+            # Slack Connect / external guest: the sender's user ID belongs to another org and
+            # startStream rejects it. The recipient user is optional, so retry once without it
+            # instead of degrading to a permanent plain-text progress message.
+            logger.info("[Slack] startStream rejected recipient_user_id (external user); "
+                        "retrying task card without it: channel=%s", stream.channel)
+            start_payload.pop("recipient_user_id", None)
+            result = await client.api_call("chat.startStream", json=start_payload)
         if hasattr(result, "get"):
             stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
         if not stream.stream_ts:
@@ -2610,7 +2621,16 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             start_kwargs["recipient_team_id"] = str(team_id)
         if text[base:].strip():
             start_kwargs["markdown_text"] = text[base:]
-        response = await client.chat_startStream(**start_kwargs)
+        try:
+            response = await client.chat_startStream(**start_kwargs)
+        except Exception as exc:
+            if not (_slack_error_is(exc, "user_not_found") and start_kwargs.get("recipient_user_id")):
+                raise
+            # External (Slack Connect) sender: retry once without the foreign recipient user.
+            logger.info("[Slack] startStream rejected recipient_user_id (external user); "
+                        "retrying stream without it: channel=%s", chat_id)
+            start_kwargs.pop("recipient_user_id", None)
+            response = await client.chat_startStream(**start_kwargs)
         ts = response.get("ts") if response else None
         if not ts:
             raise RuntimeError("chat.startStream returned no ts")
@@ -3912,6 +3932,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         is not foreign: ``authorizations[0]`` may name another install of the same Grid org."""
         return bool(author_team and resolved_team and author_team != resolved_team
                     and not self._team_in_install_set(author_team))
+
 
     @staticmethod
     def _context_channel_id(context: Any) -> str:
