@@ -137,6 +137,7 @@ class GatewaySessionWatchersMixin(GatewayAutoResumeMixin):
         """Run the claimed cache-edge *action* on one idle chat: ``compact`` through the manual
         ``/compress`` pipeline (temporary agent, compression lease, persist, evict) with an automatic
         trigger, ``offload`` through the cold prune; in the chat's profile scope."""
+        from gateway.session_persistence import authority_persistence
         claimed_session = getattr(live_agent, "session_id", None)
         async with slots:
             try:
@@ -147,9 +148,18 @@ class GatewaySessionWatchersMixin(GatewayAutoResumeMixin):
                     return
                 with self._profile_scope_for_source(entry.origin):
                     live = authority.sessions.get(owner) if authority is not None else None
+                    if authority is not None and live is None:
+                        return  # no gate to serialize the FIFO claim against: never run ungated
                     # The FIFO claim waits on ``claim_gate`` (as behind ``/compress``): a message
                     # arriving mid-summary starts its turn on the compacted history, not the old one.
                     async with live.claim_gate if live is not None else contextlib.nullcontext():
+                        # A claim that won the gate first runs before the runner's sentinel is
+                        # installed (``_is_session_running`` reads idle); a write now would land
+                        # after its transcript mark and read as the turn's own on restart.
+                        if authority is not None and await asyncio.to_thread(
+                                authority_persistence(authority).admissions.has_pending,
+                                session_ids=(owner,), statuses=frozenset({'started', 'unknown'})):
+                            return
                         await self._compact_claimed_session(key, entry, live_agent, action)
             except Exception as e:
                 logger.warning("Cache-expiry compaction failed for %s: %s", key, e, exc_info=True)

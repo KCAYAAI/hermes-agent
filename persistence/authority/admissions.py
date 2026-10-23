@@ -35,8 +35,14 @@ __all__ = [
     "CarrierRewind",
     "ClaimedAdmission",
     "GateRefusal",
+    "LostTurnRow",
+    "LostTurnTranscript",
     "QueuedFold",
     "QueuedReplacement",
+    "RECOVERY_ATTEMPTS_PREFIX",
+    "RECOVERY_NOTIFIED_PREFIX",
+    "RECOVERY_OWED_PREFIX",
+    "RecoveryAction",
     "RetryRewriteRefused",
     "TranscriptRewrite",
     "TurnBoundary",
@@ -224,6 +230,41 @@ class UnheldMedia:
     held: frozenset[str]
 
 
+#: The ``state_meta`` keys restart recovery of a person's lost turn keeps per admission (``recover_unknown`` and its
+#: bookkeeping verbs): the automatic rerun count, the at-most-once thread notice, and the saved answer still owed.
+RECOVERY_ATTEMPTS_PREFIX = "restart_recovery_attempts:"
+RECOVERY_NOTIFIED_PREFIX = "restart_recovery_notified:"
+RECOVERY_OWED_PREFIX = "restart_recovery_owed:"
+
+#: ``recover_unknown``'s transitions of an ``unknown`` admission.
+RecoveryAction = Literal["completed", "requeue", "interrupted"]
+
+
+@dataclass(frozen=True, slots=True)
+class LostTurnRow:
+    """One transcript row ``lost_turn_transcript`` reads: the stored columns a restart recovery decides from."""
+
+    role: str
+    content: Any
+    tool_calls: Any
+    tool_call_id: str | None
+    display_kind: str | None
+    timestamp: float | None
+    active: bool
+    finish_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LostTurnTranscript:
+    """What a lost turn saved (``lost_turn_transcript``): anchored on its own ``user`` row, the rows after it in id order;
+    unanchored, ``ran_since`` says whether an ``assistant`` or ``tool`` row was saved since the given time."""
+
+    anchored: bool
+    anchor_timestamp: float | None
+    ran_since: bool
+    rows: tuple[LostTurnRow, ...]
+
+
 class RetryRewriteRefused(Conflict, RuntimeError):
     """The planned ``/retry`` rewrite no longer applies (the transcript changed since the read, a turn lease is live, the session closed): the re-send was refused with it and nothing was written."""
 
@@ -311,6 +352,29 @@ class AdmissionRepository(Protocol):
         """
         ...
 
+    def recover_unknown(self, *, epoch: int, admission_id: str, generation: int, action: RecoveryAction, notice: str | None = None, captured: CapturedResult | None = None, owed: str | None = None) -> tuple[AdmissionRecord, bool]:
+        """Restart recovery of a person's ``unknown`` messaging turn, decided by the caller from the saved transcript; the bool is ``recovered_now``.
+
+        Order: ``action`` (``invalid_params``); epoch; the row (``not_found``); a row already ``terminal``, ``queued`` or ``started`` (recovered before, or resolved by a person's /discard) is returned unchanged with ``recovered_now`` False; a row not ``unknown`` at ``generation`` refuses ``stale_generation``. Then, in one write: ``notice`` (when given) closes the turn with the discarded-turn closer, the workers retire, and ``completed`` commits ``captured`` (required, ``invalid_params`` without it) as the turn's stored result plus ``owed`` under :data:`RECOVERY_OWED_PREFIX`, ``requeue`` bumps the :data:`RECOVERY_ATTEMPTS_PREFIX` count and puts the row back to ``queued`` at its own ``seq`` with no generation, ``interrupted`` ends it; the row goes terminal (but for ``requeue``) and the revision bumps.
+        """
+        ...
+
+    def recovery_attempts(self, *, admission_id: str) -> int:
+        """The automatic reruns ``recover_unknown`` committed for the admission (``requeue``); 0 when none, 1000 when the stored count is unreadable."""
+        ...
+
+    def claim_recovery_notice(self, *, admission_id: str) -> bool:
+        """Claim the admission's restart thread notice: True only for the first claim ever (durable under :data:`RECOVERY_NOTIFIED_PREFIX`)."""
+        ...
+
+    def owed_recovery_answers(self) -> list[tuple[str, str]]:
+        """``(admission_id, owed record)`` of every answer ``recover_unknown`` recorded as owed and nobody cleared, in key order."""
+        ...
+
+    def clear_recovery_owed(self, *, admission_id: str) -> None:
+        """Delete the admission's owed-answer record; absent is a no-op."""
+        ...
+
     def compact_api_payloads(self, *, admission_ids: Sequence[str]) -> int:
         """One write: each given row re-read under the candidate predicate and, when ``session_rules.api_payloads.compacted_api_payload`` changes its payload, rewritten with it; ``payload_digest`` is untouched. Returns the rows written."""
         ...
@@ -363,6 +427,11 @@ class AdmissionRepository(Protocol):
 
     def list_unknown(self) -> list[AdmissionRecord]:
         """Every ``unknown`` admission in ``seq`` order."""
+        ...
+
+    def lost_turn_transcript(self, *, session_id: str, event_id: str | None, since: float | None,
+                             admission_id: str | None = None) -> LostTurnTranscript:
+        """One read over the session's compression chain and its local physical target's chain: the anchor is the newest ``user`` row whose ``platform_message_id`` is ``event_id`` (none without ``event_id``); anchored, the rows after it in id order; unanchored, whether an ``assistant`` or ``tool`` row was saved at or after ``since`` (False without ``since``) and above the transcript mark *admission_id*'s claim stored (no such bound when it stored none). An unknown session refuses ``not_found``, a cyclic chain ``admission_conflict``."""
         ...
 
     def has_pending(self, *, session_ids: Sequence[str] = (), statuses: frozenset[str] | None = None) -> bool:
