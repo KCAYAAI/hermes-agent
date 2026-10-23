@@ -6185,3 +6185,47 @@ class TestAgentSessionsIndependentValidation:
                 await asyncio.wrap_future(future)
         assert not a._active_status_threads
         assert completed[-1] == "active"
+
+
+class TestNativeTaskCardAmbiguousStart:
+    """Review 2026-10-22: a startStream whose answer was lost may have opened a card already (and the
+    SDK can retry connection errors internally), so a failed start is never retried. A failed
+    append to a live card is retryable: every frame carries the full projection."""
+
+    @staticmethod
+    def _adapter_raising(adapter, start_exc=None, append_exc=None):
+        client = adapter._app.client
+
+        async def api_call(method, *, json):
+            if method == "chat.startStream":
+                if start_exc is not None:
+                    raise start_exc
+                return {"ts": "stream-1"}
+            if method == "chat.appendStream" and append_exc is not None:
+                raise append_exc
+            return {"ok": True}
+
+        client.api_call.side_effect = api_call
+
+    @pytest.mark.asyncio
+    async def test_start_answer_lost_is_not_retryable(self, adapter):
+        self._adapter_raising(adapter, start_exc=TimeoutError())
+        result = await adapter.send_native_task_card_progress(
+            "C1", [{"id": "c", "title": "t", "status": "in_progress"}], metadata={"thread_id": "th-1"})
+        assert result.success is False and result.retryable is False
+        assert result.error.startswith("startStream outcome unknown")
+
+    @pytest.mark.asyncio
+    async def test_any_failed_start_is_not_retryable(self, adapter):
+        self._adapter_raising(adapter, start_exc=ConnectionError("dns"))
+        result = await adapter.send_native_task_card_progress(
+            "C1", [{"id": "c", "title": "t", "status": "in_progress"}], metadata={"thread_id": "th-1"})
+        assert result.success is False and result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_append_failure_on_a_live_card_is_retryable(self, adapter):
+        self._adapter_raising(adapter, append_exc=TimeoutError())
+        result = await adapter.send_native_task_card_progress(
+            "C1", [{"id": "c", "title": "t", "status": "in_progress"}], metadata={"thread_id": "th-1"})
+        assert result.success is False and result.retryable is True
+
