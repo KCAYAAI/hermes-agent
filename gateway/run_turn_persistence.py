@@ -747,14 +747,18 @@ class GatewayTurnPersistenceMixin:
         """Stop the typing indicator (never raises), with the delivery path's thread/workspace routing
         metadata (Slack AI status is thread-scoped), on this turn's own message, not the chat's latest."""
         from gateway.platforms.helpers import typing_metadata_for_turn
+        from gateway.turn_cleanup import run_bounded
         with suppress(Exception):
             _typing_adapter = self._delivery_adapter_for(source)
             _kind = type(_typing_adapter)
+            # Bounded: clearing a status line is cosmetic and must never hold the reply.
             if _typing_adapter and callable(getattr(_kind, "_stop_typing_with_metadata", None)):
-                await _typing_adapter._stop_typing_with_metadata(source.chat_id, typing_metadata_for_turn(_typing_adapter,
-                    source.chat_id, self._reply_anchor_for_event(event), self._event_thread_metadata(event, source)))
+                await run_bounded(
+                    _typing_adapter._stop_typing_with_metadata(source.chat_id, typing_metadata_for_turn(_typing_adapter,
+                        source.chat_id, self._reply_anchor_for_event(event), self._event_thread_metadata(event, source))),
+                    label="typing-status clear")
             elif _typing_adapter and callable(getattr(_kind, "stop_typing", None)):
-                await _typing_adapter.stop_typing(source.chat_id)
+                await run_bounded(_typing_adapter.stop_typing(source.chat_id), label="typing-status clear")
 
     def _hmwa_pause_typing_after_silence(self, event, source) -> None:
         """A turn that ends in intentional silence has nothing left to show: pause the adapter's typing
