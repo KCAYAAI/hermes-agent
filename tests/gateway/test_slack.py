@@ -2710,6 +2710,8 @@ class TestReactions:
         """Reactions should be bracketed around actual processing via hooks."""
         adapter._app.client.reactions_add = AsyncMock()
         adapter._app.client.reactions_remove = AsyncMock()
+        # an old ts: the ledger reads the message's reactions once before changing them
+        adapter._app.client.reactions_get = AsyncMock(return_value={"message": {"reactions": []}})
         adapter._app.client.users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Tyler"}}}
         )
@@ -4907,8 +4909,9 @@ class TestNativeTaskCardProgress:
             ("chat.appendStream", "stream-1"),  # rejected: expired
             ("chat.startStream", None),
             ("chat.appendStream", "stream-2"),
+            ("chat.delete", "stream-1"),  # one card per turn: the sealed card goes once its replacement is live
         ]
-        reopened = client.api_call.await_args_list[-1].kwargs["json"]["chunks"]
+        reopened = client.api_call.await_args_list[-2].kwargs["json"]["chunks"]
         assert [(c["id"], c["status"]) for c in reopened if c["type"] == "task_update"] == [
             ("call-1", "complete"), ("call-2", "in_progress"),
         ]
@@ -4942,6 +4945,227 @@ class TestNativeTaskCardProgress:
         assert [c.args[0] for c in client.api_call.await_args_list] == [
             "chat.startStream", "chat.appendStream", "chat.startStream", "chat.appendStream",
         ]
+
+    @pytest.mark.asyncio
+    async def test_deleted_card_is_not_reused_by_the_next_turn(self, adapter):
+        """Review of #123458/#123459: a cancelled turn can skip the stopStream pop. Once cleanup
+        deletes that card, the next update in the thread must open a fresh card instead of
+        appending to the deleted ts (message_not_found -> every update degrades to text)."""
+        client = adapter._app.client
+        starts = 0
+
+        async def api_call(method, *, json):
+            nonlocal starts
+            if method == "chat.startStream":
+                starts += 1
+                return {"ts": f"stream-{starts}"}
+            return {"ok": True}
+
+        client.api_call.side_effect = api_call
+        client.chat_delete = AsyncMock(return_value={"ok": True})
+        metadata = {"thread_id": "thread-1"}
+        task = [{"id": "call-1", "title": "terminal", "status": "in_progress"}]
+
+        first = await adapter.send_native_task_card_progress("C1", task, metadata=metadata)
+        assert first.message_id == "stream-1"
+        # Turn cancelled: no stop_native_task_card_progress; cleanup deletes the card id.
+        assert await adapter.delete_message("C1", "stream-1") is True
+        second = await adapter.send_native_task_card_progress("C1", task, metadata=metadata)
+
+        assert second.success is True and second.message_id == "stream-2"
+        appends = [c.kwargs["json"]["ts"] for c in client.api_call.await_args_list
+                   if c.args[0] == "chat.appendStream"]
+        assert appends == ["stream-1", "stream-2"]
+
+    @pytest.mark.asyncio
+    async def test_failed_card_delete_keeps_the_card_registered(self, adapter):
+        """A refused chat.delete leaves the card visible; keep it so the turn can still stop it."""
+        client = adapter._app.client
+        client.api_call.side_effect = lambda method, *, json: (
+            {"ts": "stream-1"} if method == "chat.startStream" else {"ok": True})
+        client.chat_delete = AsyncMock(return_value={"ok": False, "error": "cant_delete_message"})
+        metadata = {"thread_id": "thread-1"}
+        await adapter.send_native_task_card_progress(
+            "C1", [{"id": "c", "title": "terminal", "status": "in_progress"}], metadata=metadata)
+
+        assert await adapter.delete_message("C1", "stream-1") is False
+        (stream,) = adapter._native_task_card_streams.values()
+        assert stream.stream_ts == "stream-1"
+
+    @pytest.mark.asyncio
+    async def test_sealed_card_delete_failure_keeps_the_new_card(self, adapter):
+        """Deleting the sealed card is best effort: a refusal must not fail the update."""
+        client = adapter._app.client
+        starts = 0
+
+        async def api_call(method, *, json):
+            nonlocal starts
+            if method == "chat.startStream":
+                starts += 1
+                return {"ts": f"stream-{starts}"}
+            if method == "chat.appendStream" and json["ts"] == "stream-1" and starts == 1:
+                raise _StreamExpiredError("expired", {"ok": False, "error": "message_not_in_streaming_state"})
+            if method == "chat.delete":
+                raise RuntimeError("cant_delete_message")
+            return {"ok": True}
+
+        client.api_call.side_effect = api_call
+        result = await adapter.send_native_task_card_progress(
+            "C1", [{"id": "call-1", "title": "terminal", "status": "in_progress"}], metadata={"thread_id": "thread-1"},
+        )
+        assert result.success is True and result.message_id == "stream-2"
+
+
+class TestDeferredCompletionReaction:
+    """Adapter wiring to the ReactionLedger (behavior is covered in test_slack_reaction_ledger)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_checks(self, monkeypatch):
+        import gateway.reaction_deferral as rd
+        monkeypatch.setattr(rd, "_checks", [])
+        yield rd
+
+    def _event(self, adapter, ts="111.1", thread=None, team=None):
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        src = SessionSource(platform=Platform.SLACK, chat_id="C1", user_id="U1", chat_type="group",
+                            thread_id=thread, scope_id=team)
+        ev = MessageEvent(text="hi", source=src, message_id=ts)
+        adapter._reacting_message_ids.add(adapter._workspace_message_marker(team or "", ts))
+        return ev
+
+    def _reactions(self, adapter):
+        c = adapter._app.client
+        return ([("add", k.kwargs["timestamp"], k.kwargs["name"]) for k in c.reactions_add.await_args_list]
+                + [("remove", k.kwargs["timestamp"], k.kwargs["name"]) for k in c.reactions_remove.await_args_list])
+
+    @pytest.fixture()
+    def mocked(self, adapter):
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.reactions_get = AsyncMock(return_value={"message": {"reactions": []}})
+        adapter._get_client = lambda channel, team_id=None: adapter._app.client
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_start_and_success_react_in_order(self, mocked):
+        from gateway.platforms.base import ProcessingOutcome
+        ev = self._event(mocked)
+        await mocked.on_processing_start(ev)
+        await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        assert self._reactions(mocked) == [("add", "111.1", "eyes"), ("add", "111.1", "white_check_mark"),
+                                           ("remove", "111.1", "eyes")]
+        assert mocked._reactions.entries() == {}
+
+    @pytest.mark.asyncio
+    async def test_overlapping_turns_both_reach_the_ledger(self, mocked):
+        """14th review: the second completion must not be dropped with the marker."""
+        from gateway.platforms.base import ProcessingOutcome
+        ev = self._event(mocked)
+        await mocked.on_processing_start(ev)
+        await mocked.on_processing_start(ev)
+        await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        assert mocked._reactions.entries() == {}
+        assert ("add", "111.1", "white_check_mark") in self._reactions(mocked)
+        assert not mocked.is_live("", "C1", "111.1")
+
+    @pytest.mark.asyncio
+    async def test_completion_cancelled_mid_call_then_failure_ends_x(self, mocked):
+        """16th review: the gateway's second (FAILURE) hook for the same event reaches the ledger."""
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+        c = mocked._app.client
+        ev = self._event(mocked)
+        await mocked.on_processing_start(ev)
+        calls = {"n": 0}
+
+        async def add(**kw):
+            calls["n"] += 1
+            if kw["name"] == "white_check_mark" and calls["n"] == 1:
+                raise asyncio.CancelledError()
+
+        c.reactions_add = AsyncMock(side_effect=add)
+        with pytest.raises(asyncio.CancelledError):
+            await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        c.reactions_get = AsyncMock(return_value={"message": {"reactions": [
+            {"name": "eyes", "users": [mocked._bot_user_id or ""]},
+            {"name": "white_check_mark", "users": [mocked._bot_user_id or ""]}]}})
+        await mocked.on_processing_complete(ev, ProcessingOutcome.FAILURE)
+        names = [k.kwargs["name"] for k in c.reactions_add.await_args_list]
+        removed = [k.kwargs["name"] for k in c.reactions_remove.await_args_list]
+        assert "x" in names and "white_check_mark" in removed and "eyes" in removed
+        assert mocked._reactions.entries() == {}
+
+    @pytest.mark.asyncio
+    async def test_running_work_holds_the_check_until_the_thread_finishes(self, mocked, _clean_checks):
+        from gateway.platforms.base import ProcessingOutcome
+        running = {"on": True}
+        _clean_checks.register_completion_deferral(
+            lambda chat_id, thread_id, adapter, **_: "hold" if running["on"] and adapter is mocked
+            and (chat_id, thread_id) == ("C1", "100.0") else None)
+        for ev in (self._event(mocked, "100.0"), self._event(mocked, "105.0", thread="100.0")):
+            await mocked.on_processing_start(ev)
+            await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        assert ("add", "100.0", "white_check_mark") not in self._reactions(mocked)
+        running["on"] = False
+        assert await mocked.finish_deferred_reactions("C1", "100.0") == 2
+        for ts in ("100.0", "105.0"):
+            assert ("add", ts, "white_check_mark") in self._reactions(mocked)
+            assert ("remove", ts, "eyes") in self._reactions(mocked)
+        assert await mocked.finish_deferred_reactions("C1", "100.0") == 0
+
+    @pytest.mark.asyncio
+    async def test_other_profiles_work_never_holds_this_adapters_check(self, mocked, _clean_checks):
+        from gateway.platforms.base import ProcessingOutcome
+        other = object()
+        _clean_checks.register_completion_deferral(lambda adapter, **_: "hold" if adapter is other else None)
+        ev = self._event(mocked)
+        await mocked.on_processing_start(ev)
+        await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        assert ("add", "111.1", "white_check_mark") in self._reactions(mocked)
+
+    @pytest.mark.asyncio
+    async def test_hold_check_receives_the_workspace(self, mocked, _clean_checks):
+        from gateway.platforms.base import ProcessingOutcome
+        seen = []
+        _clean_checks.register_completion_deferral(lambda team_id="", **_: seen.append(team_id))
+        ev = self._event(mocked, team="T9")
+        await mocked.on_processing_start(ev)
+        await mocked.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+        assert seen and set(seen) == {"T9"}
+
+    @pytest.mark.asyncio
+    async def test_slack_errors_map_to_ledger_results(self, mocked):
+        from plugins.platforms.slack import reaction_ledger as rl
+
+        class E(Exception):
+            def __init__(self, code):
+                self.response = {"error": code}
+
+        c = mocked._app.client
+        c.reactions_add = AsyncMock(side_effect=E("already_reacted"))
+        assert await mocked.react("", "C1", "1.0", "eyes", False) == rl.OK
+        c.reactions_remove = AsyncMock(side_effect=E("no_reaction"))
+        assert await mocked.react("", "C1", "1.0", "eyes", True) == rl.OK
+        c.reactions_add = AsyncMock(side_effect=E("missing_scope"))
+        assert await mocked.react("", "C1", "1.0", "eyes", False) == rl.FAIL
+        c.reactions_add = AsyncMock(side_effect=E("message_not_found"))
+        assert await mocked.react("", "C1", "1.0", "eyes", False) == rl.GONE
+
+    @pytest.mark.asyncio
+    async def test_read_returns_only_the_bots_own_reactions(self, mocked):
+        mocked._bot_user_id = "UBOT"
+        mocked._app.client.reactions_get = AsyncMock(return_value={"message": {"reactions": [
+            {"name": "eyes", "users": ["UBOT"]}, {"name": "tada", "users": ["UX"]}]}})
+        assert await mocked.read("", "C1", "1.0") == {"eyes"}
+
+    def test_ledger_file_is_per_bot_under_hermes_home(self, mocked, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mocked._team_bot_user_ids = {"T1": "UBOT"}
+        path = mocked._reaction_ledger_path()
+        assert path.name == "slack-reactions-T1-UBOT.json"
 
 
 # ---------------------------------------------------------------------------
@@ -5684,3 +5908,150 @@ class TestNonConversationalSubtypeAllowlist:
         for event in events:
             accepted = await adapter._prefilter_inbound(event, None)
             assert accepted is not None and accepted[0]["channel"] == "C_FREE", event.get("subtype")
+
+
+class TestAgentSessionsIndependentValidation:
+    """Mock-based lifecycle review coverage; never connects to Slack."""
+
+    def _adapter(self):
+        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
+        a = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._app.client.agents_sessions_setStatus = AsyncMock()
+        a._app.client.assistant_threads_setStatus = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status,expected", [
+        ("is thinking...", "processing"),
+        ("", "active"),
+        ("suspended", "suspended"),
+        ("closed", "closed"),
+    ])
+    async def test_status_payload_is_lifecycle_enum(self, status, expected):
+        a = self._adapter()
+        await a._set_thread_status("C123", "T1", "100.001", status, "review")
+        a._app.client.agents_sessions_setStatus.assert_awaited_once_with(
+            channel_id="C123", thread_ts="100.001", status=expected)
+        a._app.client.assistant_threads_setStatus.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_status_write_is_retried(self):
+        a = self._adapter()
+        a._app.client.agents_sessions_setStatus.side_effect = [
+            RuntimeError("temporary mock failure"), None]
+        for _ in range(2):
+            await a.send_typing("C123", metadata={"thread_id": "100.001"})
+        assert a._app.client.agents_sessions_setStatus.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_same_state_refreshes_at_sixty_seconds(self, monkeypatch):
+        a = self._adapter()
+        clock = [1000.0]
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: clock[0])
+        metadata = {"thread_id": "100.001"}
+        await a.send_typing("C123", metadata=metadata)
+        clock[0] += 59.0
+        await a.send_typing("C123", metadata=metadata)
+        assert a._app.client.agents_sessions_setStatus.await_count == 1
+        clock[0] += 1.0
+        await a.send_typing("C123", metadata=metadata)
+        assert a._app.client.agents_sessions_setStatus.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_next_turn_in_same_thread_is_not_deduped(self):
+        a = self._adapter()
+        metadata = {"thread_id": "100.001"}
+        await a.send_typing("C123", metadata=metadata)
+        await a.stop_typing("C123", metadata=metadata)
+        await a.send_typing("C123", metadata=metadata)
+        assert [c.kwargs["status"] for c in
+                a._app.client.agents_sessions_setStatus.await_args_list] == [
+                    "processing", "active", "processing"]
+
+    @pytest.mark.asyncio
+    async def test_deduplication_is_workspace_scoped(self):
+        a = self._adapter()
+        first, second = AsyncMock(), AsyncMock()
+        a._team_clients = {"T1": first, "T2": second}
+        for team in ("T1", "T2", "T1", "T2"):
+            await a.send_typing("C123", metadata={
+                "thread_id": "100.001", "team_id": team})
+        first.agents_sessions_setStatus.assert_awaited_once_with(
+            channel_id="C123", thread_ts="100.001", status="processing")
+        second.agents_sessions_setStatus.assert_awaited_once_with(
+            channel_id="C123", thread_ts="100.001", status="processing")
+
+    @pytest.mark.asyncio
+    async def test_typing_disabled_does_not_schedule_lifecycle_writes(self):
+        a = self._adapter()
+        a.config.typing_indicator = False
+        assert a._start_typing_refresh(
+            SimpleNamespace(), asyncio.Event(), {"thread_id": "100.001"}) is None
+        a.pause_typing_for_chat("C123")
+        a.resume_typing_for_chat("C123")
+        a._app.client.agents_sessions_setStatus.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queued_pause_cannot_overwrite_completed_thread(self, monkeypatch):
+        a = self._adapter()
+        metadata = {"thread_id": "100.001"}
+        await a.send_typing("C123", metadata=metadata)
+        futures = []
+        submit = asyncio.run_coroutine_threadsafe
+
+        def capture(coro, loop):
+            future = submit(coro, loop)
+            futures.append(future)
+            return future
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", capture)
+        # The generic final-delivery path also calls pause on the event loop.
+        # An immediately completing mocked clear needs no loop yield, leaving
+        # the scheduled pause behind it. Await the real submitted futures so
+        # the interleaving is deterministic, not a timing/sleep assertion.
+        a.pause_typing_for_chat("C123")
+        await a.stop_typing("C123", metadata=metadata)
+        for future in futures:
+            await asyncio.wrap_future(future)
+        assert not a._active_status_threads
+        assert a._app.client.agents_sessions_setStatus.await_args_list[-1].kwargs[
+            "status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_inflight_pause_cannot_finish_after_clear(self, monkeypatch):
+        a = self._adapter()
+        metadata = {"thread_id": "100.001"}
+        await a.send_typing("C123", metadata=metadata)
+        entered, release = asyncio.Event(), asyncio.Event()
+        completed = []
+
+        async def delayed_status(**kwargs):
+            if kwargs["status"] == "suspended":
+                entered.set()
+                await release.wait()
+            completed.append(kwargs["status"])
+
+        a._app.client.agents_sessions_setStatus.side_effect = delayed_status
+        futures = []
+        submit = asyncio.run_coroutine_threadsafe
+
+        def capture(coro, loop):
+            future = submit(coro, loop)
+            futures.append(future)
+            return future
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", capture)
+        a.pause_typing_for_chat("C123")
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            # Model Slack accepting the final clear before the older pause
+            # request finishes. No wall-clock sleep or live API is involved.
+            await a.stop_typing("C123", metadata=metadata)
+        finally:
+            release.set()
+            for future in futures:
+                await asyncio.wrap_future(future)
+        assert not a._active_status_threads
+        assert completed[-1] == "active"
