@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -472,13 +473,30 @@ class SQLiteSessionMaintenance(SessionPortability):
             fields = tuple(field for field in SESSION_PROJECTION_FIELDS if field in available)
             if not fields:
                 return None
-            order = " ORDER BY id" if "id" in available else ""
-            rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}")
-            digest = hashlib.blake2b(digest_size=16)
-            for row in rows:
-                digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
-                digest.update(b"\0")
-            return fields, digest.digest()
+            # One statement, not a Python row loop (KC): sqlite3 releases the GIL around every row
+            # step, so a per-row loop re-acquires the GIL once per session. Worst case, against one
+            # pure-Python CPU-bound thread, that measured ~72 s for 6.7k rows (~0.1 s here), all
+            # while holding a WAL read snapshot. SQLite serializes the rows in C, and blake2b
+            # hashes the blob without the GIL. quote() keeps NULL, '', numbers and BLOBs distinct.
+            # bytes text_factory: no 1.8 MB decode/encode copy, and invalid UTF-8 in a title
+            # cannot make the read raise and pin the store to a stale digest. The read connection
+            # is shared, so its own factory is restored after this one statement.
+            row_sql = " || char(31) || ".join(f"quote({field})" for field in fields)
+            if "id" not in available:
+                query = f"SELECT group_concat({row_sql}, char(30)) FROM sessions"
+            elif sqlite3.sqlite_version_info >= (3, 44):
+                # ORDER BY inside the aggregate makes row order part of the contract.
+                query = f"SELECT group_concat({row_sql}, char(30) ORDER BY id) FROM sessions"
+            else:
+                query = (f"SELECT group_concat(r, char(30)) FROM "
+                         f"(SELECT {row_sql} AS r FROM sessions ORDER BY id)")
+            factory = conn.text_factory
+            conn.text_factory = bytes
+            try:
+                (blob,) = conn.execute(query).fetchone()
+            finally:
+                conn.text_factory = factory
+            return fields, hashlib.blake2b(blob or b"", digest_size=16).digest()
 
     def retained_tree_is_live(self, worktree_path: str, *, pending_only: bool = False) -> bool:
         inside = _inside_tree(worktree_path)
