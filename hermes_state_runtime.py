@@ -694,6 +694,78 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
     return db._execute_write(write)
 
 
+def recover_unknown_session_input(db, *, epoch: int, admission_id: str, generation: int, action: str,
+                                  stored: tuple | None = None, owed: str | None = None,
+                                  _terminal_write=None) -> dict:
+    """Restart recovery of a person's ``unknown`` messaging turn, decided from its saved
+    transcript (``gateway.session_restart_recovery``). One fenced transaction, like
+    ``resolve_unknown_session_input``:
+
+    * ``completed``: the turn's final answer was saved before the owner died; ``stored`` is
+      ``prepare_result``'s ``(outcome, stored_result)`` and commits as the turn's result.
+    * ``requeue``: nothing with an effect ran; the row goes back to ``queued`` in its own FIFO
+      place (same seq, requester and payload). The attempt counter in ``state_meta`` is bumped in
+      the same write so a turn that keeps dying is never re-run more than the caller's cap.
+    * ``interrupted``: the turn ends; ``_terminal_write`` writes its transcript boundary.
+
+    ``owed`` (``completed`` only): the saved answer still to deliver, recorded in the same write
+    (``state_meta`` ``restart_recovery_owed:<admission>``) so it is owed exactly when the turn settled.
+
+    An exact retry of a recovery that already committed returns the row unchanged. The result's
+    ``recovered_now`` is True only when THIS call made the transition."""
+    if action not in ('completed', 'requeue', 'interrupted'):
+        raise RuntimeStoreError('invalid_params')
+    from hermes_state_terminal import RESULT_PREFIX
+    attempts_key = 'restart_recovery_attempts:' + admission_id
+
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if type(generation) is not int:
+            raise RuntimeStoreError('stale_generation')
+        if row['status'] != 'unknown' or row['generation'] != generation:
+            if row['status'] in ('terminal', 'queued', 'started'):
+                # Already recovered, or resolved by a person's /discard: this call changed nothing,
+                # so its caller must not act (e.g. send the answer of a turn the person dropped).
+                return {**_row(row), 'recovered_now': False}
+            raise RuntimeStoreError('stale_generation')
+        if _terminal_write is not None:
+            _terminal_write(conn, row)
+        _retire_admission_workers(conn, row, row['owner_epoch'])
+        if action == 'requeue':
+            found = conn.execute('SELECT value FROM state_meta WHERE key=?', (attempts_key,)).fetchone()
+            try:
+                count = int(found[0]) + 1 if found else 1
+            except (TypeError, ValueError):
+                count = 1_000
+            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (attempts_key, str(count)))
+            conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL "
+                         "WHERE admission_id=?", (admission_id,))
+        else:
+            outcome = 'interrupted'
+            if action == 'completed':
+                if stored is None:
+                    raise RuntimeStoreError('invalid_params')
+                outcome, result = stored
+                if outcome not in ('completed', 'failed', 'interrupted'):
+                    raise RuntimeStoreError('invalid_params')
+                from hermes_state_terminal import compact_result, encode_result
+                conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
+                             'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                             (RESULT_PREFIX + admission_id, _json(encode_result(compact_result(
+                                 result, user_message=json.loads(row['payload_json']).get('text'))))))
+                if owed is not None:
+                    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
+                                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                                 ('restart_recovery_owed:' + admission_id, owed))
+            conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?",
+                         (outcome, admission_id))
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
+        return {**_row(_admission(conn, admission_id)), 'recovered_now': True}
+    return db._execute_write(write)
+
+
 def _worker_public(row):
     result = dict(row)
     result.pop('adoption_digest')
