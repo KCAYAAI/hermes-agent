@@ -3304,9 +3304,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     delivered = delivered or sent.success
                     partial = partial or not sent.success  # the link was all that was left of this image
                     retry.remove((image_url, alt_text))
-                if len(file_uploads) + len(refused) < len(chunk):
-                    partial = True  # some images could not be read and left no link (missing local file)
+                # Some images could not be read and left no link either (a missing local file).
+                chunk_partial = len(file_uploads) + len(refused) < len(chunk)
                 if not file_uploads:
+                    partial = partial or chunk_partial
                     continue
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
                 logger.info(
@@ -3317,12 +3318,15 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     thread_ts=thread_ts)
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 delivered = True
+                partial = partial or chunk_partial
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True)
                 fallback = await super().send_multiple_images(chat_id, retry, metadata, human_delay=human_delay)
                 delivered = delivered or fallback.success
+                # The per-image fallback resends everything this chunk still owes, so its outcome
+                # replaces the chunk's provisional collection loss (earlier chunks keep theirs).
                 partial = partial or not fallback.success or fallback.error_kind == "partial"
         if delivered and partial:
             return SendResult(success=True, error="some images failed to send", error_kind="partial")

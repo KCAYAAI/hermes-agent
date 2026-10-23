@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import contextvars
 import inspect
 import ipaddress
 import logging
@@ -90,6 +91,9 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
         os.unlink(work_path)
     return None
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# (session_key, run generation, whole final reply delivered) for the task firing its post-delivery
+# callbacks. A ContextVar, not adapter state: overlapping runs of one session cannot clobber it.
+_DELIVERY_OUTCOME: contextvars.ContextVar = contextvars.ContextVar("hermes_delivery_outcome", default=None)
 # History dedup is best-effort: stay well below the Discord heartbeat watchdog and fail open.
 _HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS = 5.0
 # Timed-out reads can't be cancelled mid-SQLite: cap the isolated threads so wedged lookups
@@ -2886,8 +2890,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         ``send_animation``, local files via ``send_image_file``); override to bundle natively
         (Signal). Returns success when at least one image was delivered — the outcome
         the turn-level delivery tracker records; every override must return the same
-        aggregate, or a media-only turn on that platform reports FAILURE (#106153)."""
-        delivered = False
+        aggregate, or a media-only turn on that platform reports FAILURE (#106153). When some
+        images failed, the success carries ``error_kind="partial"`` (the reply is incomplete)."""
+        delivered = failed = False
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -2904,13 +2909,17 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 img_result = await sender(
                     chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
                 if not img_result.success:
+                    failed = True
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
                     delivered = True
             except Exception as img_err:
+                failed = True
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
         if not images:
             return SendResult(success=False, error="no images to send")
+        if delivered and failed:
+            return SendResult(success=True, error="some images failed to send", error_kind="partial")
         return SendResult(
             success=delivered,
             error=None if delivered else "all images failed to send")
@@ -3381,6 +3390,21 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
         return _chained
+
+    def last_delivery_complete(self, session_key: str, *, generation: int | None = None) -> bool | None:
+        """Whether the turn now firing its post-delivery callbacks delivered its whole final reply
+        (every send succeeded). Scoped to the firing task (a ContextVar), so overlapping runs of
+        one session never see or clear each other's outcome. None when unknown (another delivery
+        lane, another session, or a different run generation): callers keep their old behavior."""
+        entry = _DELIVERY_OUTCOME.get()
+        if entry is None or not session_key:
+            return None
+        entry_key, entry_generation, delivered = entry
+        if entry_key != session_key:
+            return None
+        if generation is not None and entry_generation is not None and int(entry_generation) != int(generation):
+            return None
+        return bool(delivered)
 
     def pop_post_delivery_callback(
         self, session_key: str, *, generation: int | None = None) -> Callable | None:
@@ -4412,12 +4436,17 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        delivery_failed = False  # any final send failed: the reply is incomplete (keeps breadcrumbs)
+        processing_ok = False  # stays False on an exception/cancel path
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is not None:
                 delivery_attempted = True
-                delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                ok = bool(getattr(result, "success", False))
+                delivery_succeeded = delivery_succeeded or ok
+                # A partial batch (some images failed) is delivered but incomplete.
+                delivery_failed = delivery_failed or not ok or getattr(result, "error_kind", None) == "partial"
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4527,7 +4556,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            _outcome_token = _DELIVERY_OUTCOME.set((
+                session_key, getattr(interrupt_event, "_hermes_run_generation", None),
+                processing_ok and not delivery_failed))
+            try:
+                await self._fire_post_delivery_callback(session_key, interrupt_event)
+            finally:
+                _DELIVERY_OUTCOME.reset(_outcome_token)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.

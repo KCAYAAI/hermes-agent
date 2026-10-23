@@ -1656,6 +1656,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             display_kind=turn_ctx.persist_user_display_kind, reply_expected=turn_ctx.reply_expected)
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        # Whether this turn's first response reached the chat. None: nothing was owed (silence).
+        _first_delivered: Optional[bool] = None
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1675,7 +1677,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
+                _first_delivered = False
             else:
+                _first_delivered = bool(_text_delivered)
                 # One source of truth for "this turn's final already reached the chat": the normal
                 # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
                 # result the queued lane hands back. Every early `return result` after this point
@@ -1690,10 +1694,20 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
-            with suppress(Exception):
-                _bg_result = _bg_cb()
-                if inspect.isawaitable(_bg_result):
-                    await _bg_result
+            # The popped chain includes this turn's bubble cleanup. Tell it the outcome, as the adapter
+            # does on the normal path: a first response that was NOT delivered keeps the card and
+            # bubbles as the breadcrumb instead of deleting them.
+            from gateway.platforms.base import _DELIVERY_OUTCOME
+            _outcome_token = None if _first_delivered is None else _DELIVERY_OUTCOME.set(
+                (session_key, turn_ctx.run_generation, _first_delivered))
+            try:
+                with suppress(Exception):
+                    _bg_result = _bg_cb()
+                    if inspect.isawaitable(_bg_result):
+                        await _bg_result
+            finally:
+                if _outcome_token is not None:
+                    _DELIVERY_OUTCOME.reset(_outcome_token)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
