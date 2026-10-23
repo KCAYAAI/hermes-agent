@@ -204,11 +204,12 @@ class SessionLifecycleMixin:
         if touched is not None:
             entry.updated_at = touched
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(self, session_key: str, turn: Optional[str] = None) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
-        unwind cannot clear a newer turn."""
-        token = uuid.uuid4().hex
+        unwind cannot clear a newer turn. KC: *turn* (the admission's ledger turn tag) rides in the
+        token after ``~``, so a crash-left adoption of this marker is ledgered as that turn's."""
+        token = uuid.uuid4().hex + (f'~{turn}' if turn else '')
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:

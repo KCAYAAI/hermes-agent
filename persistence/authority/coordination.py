@@ -7,7 +7,7 @@ What each group of verbs does:
 3. Hygiene streak: an atomic ``+1`` returning the new value; reset deletes the row; an empty key answers 1 (or does nothing) without a write.
 4. Handoffs (the ``handoff_*`` columns of the session row): request arms from no state, ``completed`` or ``failed``, and with ``require_settled`` refuses first, in the same write, while durable work owns the session (:class:`persistence.core.errors.HandoffUnsettled`); the watcher re-checks that condition before it repoints; claim moves ``pending`` to ``running`` once; fail stores the error cut to 500 characters, optionally only from ``only_states``; the stale-running reclaim fails every ``running`` row in one write and never raises.
 5. Delegation ledger (``async_delegations``): dispatch is an insert-or-replace of a ``running`` row with a ``pending`` delivery; the delivery claim admits one consumer, spends one attempt, and is settled by complete, release (dropped once the budget is spent), defer (refunds the attempt) or drop; a claim on an id with no row is True with no write. The sweeps take the caller's owner probe and the copies it lost as data (``dead_owners``, ``lost_ids``) and offer nothing themselves: the helpers in tools/async_delegation.py offer the returned rows after the commit. The ledger also keeps the durable subagent records (``resumable_subagents``, :mod:`persistence.authority.subagents`); the boot recovery writes both in one transaction.
-6. Delivery obligations (``delivery_obligations``): record is an insert-or-replace of a ``pending`` row followed by the retention prune in the same write; the sweeps take the owner probe as data and claim each row guarded on its previous owner stamp.
+6. Delivery obligations (``delivery_obligations``; KC: each row tagged with its ``turn``, '' for none, NULL when written before tags): record is an insert-or-replace of a ``pending`` row followed by the retention prune in the same write; the sweeps take the owner probe as data and claim each row guarded on its previous owner stamp.
 """
 
 from __future__ import annotations
@@ -585,12 +585,16 @@ class CoordinationRepository(SubagentLedger, Protocol):
 
     # ── delivery obligations (gateway/delivery_ledger.py) ──
 
-    def record_delivery_obligation(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None, owner: OwnerStamp) -> None:
+    def record_delivery_obligation(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None, owner: OwnerStamp, turn: Optional[str] = None) -> None:
         """Insert or replace a ``pending`` row with 0 attempts, stamped to ``owner`` (``adapter_profile`` stripped, ``'default'`` when unset), then the retention prune in the same write."""
         ...
 
-    def record_crash_left_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None) -> None:
+    def record_crash_left_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, turn: Optional[str] = None) -> None:
         """Insert-or-ignore an unowned ``attempting`` row unless a row with this session key and content was created at or after ``since``."""
+        ...
+
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, owner: OwnerStamp, turn: Optional[str] = None, contents: Optional[Sequence[str]] = None, legacy_ids: Optional[Sequence[str]] = None) -> bool:
+        """Insert-or-ignore an ``attempting`` row with 1 attempt stamped to ``owner`` and tagged ``turn`` (the saved answer of a person's turn restart recovery settled); True when inserted. A ledgered row (any state) is never re-owned. Without ``turn``: skipped when a row with this session key and content was created at or after ``since``. With ``turn``: skipped only for a row with this session key that is tagged ``turn`` and has one of ``contents`` (default ``content``), or that is untagged (NULL, written before tags) and has one of ``legacy_ids`` as its id (whatever its text: the id hashes it)."""
         ...
 
     def mark_obligation_attempting(self, *, obligation_id: str) -> None:

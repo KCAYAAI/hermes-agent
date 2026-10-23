@@ -828,6 +828,10 @@ class GatewayBusySessionMixin:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+            # KC: durable before the fold returns, so restart recovery presents this turn's lost
+            # answer with the expectation it now has (a steer may not be saved as a row yet).
+            from gateway.session_restart_recovery import record_folded_reply_expected
+            record_folded_reply_expected(getattr(self, 'session_store', None), session_key, turn.event)
         return turn
 
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:

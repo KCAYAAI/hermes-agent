@@ -63,14 +63,14 @@ class ObligationLedger:
     def _obligations(self) -> dict[str, dict[str, Any]]:
         return self._table("delivery_obligations")
 
-    def record_delivery_obligation(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None, owner: OwnerStamp) -> None:
+    def record_delivery_obligation(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None, owner: OwnerStamp, turn: Optional[str] = None) -> None:
         now = time.time()
         rows = self._obligations()
         rows[obligation_id] = {
             "obligation_id": obligation_id, "session_key": session_key, "platform": platform, "chat_id": str(chat_id),
             "thread_id": str(thread_id) if thread_id else None, "content": content, "state": "pending", "attempts": 0,
             "created_at": now, "updated_at": now, "owner_pid": owner.pid, "owner_started_at": owner.started_at,
-            "last_error": None, "adapter_profile": _profile(adapter_profile)}
+            "last_error": None, "adapter_profile": _profile(adapter_profile), "turn": turn or ""}
         for key in [key for key, row in rows.items() if row["state"] in ("delivered", "abandoned") and row["updated_at"] < now - OBLIGATION_RETENTION_SECONDS]:
             del rows[key]
         if len(rows) > OBLIGATION_MAX_ROWS:
@@ -78,7 +78,7 @@ class ObligationLedger:
             for row in ordered[:len(rows) - OBLIGATION_MAX_ROWS]:
                 del rows[row["obligation_id"]]
 
-    def record_crash_left_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None) -> None:
+    def record_crash_left_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, turn: Optional[str] = None) -> None:
         now = time.time()
         rows = self._obligations()
         if obligation_id in rows or any(row["session_key"] == session_key and row["content"] == content and row["created_at"] >= since for row in rows.values()):
@@ -87,7 +87,29 @@ class ObligationLedger:
             "obligation_id": obligation_id, "session_key": session_key, "platform": platform, "chat_id": str(chat_id),
             "thread_id": str(thread_id) if thread_id else None, "content": content, "state": "attempting", "attempts": 0,
             "created_at": now, "updated_at": now, "owner_pid": None, "owner_started_at": None,
-            "last_error": None, "adapter_profile": _profile(adapter_profile)}
+            "last_error": None, "adapter_profile": _profile(adapter_profile), "turn": turn or ""}
+
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str, thread_id: Optional[str], content: str, since: float, adapter_profile: Optional[str] = None, owner: OwnerStamp, turn: Optional[str] = None, contents: Optional[Sequence[str]] = None, legacy_ids: Optional[Sequence[str]] = None) -> bool:
+        now = time.time()
+        rows = self._obligations()
+        variants = {str(c) for c in (contents or (content,))}
+        ids = {str(i) for i in (legacy_ids or ())}
+
+        def same(oid, row):
+            if row["session_key"] != session_key:
+                return False
+            if turn is None:
+                return row["content"] == content and row["created_at"] >= since
+            tag = row.get("turn")
+            return (tag == turn and row["content"] in variants) or (tag is None and oid in ids)
+        if obligation_id in rows or any(same(oid, row) for oid, row in rows.items()):
+            return False
+        rows[obligation_id] = {
+            "obligation_id": obligation_id, "session_key": session_key, "platform": platform, "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id else None, "content": content, "state": "attempting", "attempts": 1,
+            "created_at": now, "updated_at": now, "owner_pid": owner.pid, "owner_started_at": owner.started_at,
+            "last_error": None, "adapter_profile": _profile(adapter_profile), "turn": turn or ""}
+        return True
 
     def _update_state(self, obligation_id: str, state: str, error: str = "") -> None:
         row = self._obligations().get(obligation_id)

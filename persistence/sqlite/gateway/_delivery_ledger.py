@@ -46,11 +46,17 @@ def _ensure_obligations_table(conn) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            turn TEXT
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "turn" not in columns:
+        # KC: the turn a row was ledgered for ('admission:<profile>:<id>', 'crash:<session key>', '' for none).
+        # NULL only on rows a release without the column wrote (r34): restart recovery matches those by content.
+        add_column_if_missing(conn, "delivery_obligations", "turn", "turn TEXT")
 
 
 # Drops settled rows past retention, then the oldest rows over the row cap, settled ones first.
@@ -109,24 +115,25 @@ class DeliveryObligationVerbs:
     # Records a pending obligation owned by ``owner``, replacing a row with the same id, then prunes.
     def record_delivery_obligation(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str,
                                    thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
-                                   owner: OwnerStamp) -> None:
+                                   owner: OwnerStamp, turn: Optional[str] = None) -> None:
         now, (pid, started) = time.time(), (owner.pid, owner.started_at)
         def _do(conn):
             conn.execute(
                 """INSERT OR REPLACE INTO delivery_obligations
                    (obligation_id, session_key, platform, chat_id, thread_id,
                     content, state, attempts, created_at, updated_at,
-                    owner_pid, owner_started_at, adapter_profile)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                    owner_pid, owner_started_at, adapter_profile, turn)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
                 (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-                 content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+                 content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+                 turn or ''))
             _prune_unlocked(conn, now)
         with translated():
             self._obligation_write(_do)
 
     def record_crash_left_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str,
                                 thread_id: Optional[str], content: str, since: float,
-                                adapter_profile: Optional[str] = None) -> None:
+                                adapter_profile: Optional[str] = None, turn: Optional[str] = None) -> None:
         """Adopt a reply a killed process persisted but never ledgered: unowned and ``attempting``, a no-op when the
         same reply was ledgered since ``since``."""
         now = time.time()
@@ -135,15 +142,52 @@ class DeliveryObligationVerbs:
                 """INSERT OR IGNORE INTO delivery_obligations
                    (obligation_id, session_key, platform, chat_id, thread_id,
                     content, state, attempts, created_at, updated_at,
-                    owner_pid, owner_started_at, adapter_profile)
-                   SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
+                    owner_pid, owner_started_at, adapter_profile, turn)
+                   SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?
                    WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
                                      WHERE session_key = ? AND content = ? AND created_at >= ?)""",
                 (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-                 content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
+                 content, now, now, str(adapter_profile).strip() if adapter_profile else "default", turn or '',
                  session_key, content, since))
         with translated():
             self._obligation_write(_do)
+
+    def record_recovered_reply(self, *, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                               thread_id: Optional[str], content: str, since: float,
+                               adapter_profile: Optional[str] = None, owner: OwnerStamp,
+                               turn: Optional[str] = None, contents: Optional[Sequence[str]] = None,
+                               legacy_ids: Optional[Sequence[str]] = None) -> bool:
+        """Ledger the saved answer of a person's turn lost across a restart: ``attempting``, owned by ``owner``, one
+        attempt; True when inserted, False when this id or the same reply of this turn is already ledgered.
+
+        Without ``turn`` (an owed record written before turns were tagged): the same reply is any row with this
+        session key and content created at or after ``since``. With ``turn``, the same reply is a row with this
+        session key that is tagged ``turn`` and has one of ``contents`` (default: ``content``), or that is untagged
+        (``turn IS NULL``: written by a release without the column) and has one of ``legacy_ids`` as its id (the
+        id hashes its text, so the id alone identifies the send).
+        Another turn's row, an untagged ('') row and ``since`` play no part. The inserted row is tagged ``turn``."""
+        now, (pid, started) = time.time(), (owner.pid, owner.started_at)
+        if turn is None:
+            same, args = "content = ? AND created_at >= ?", [content, since]
+        else:
+            variants = [str(c) for c in (contents or (content,))]
+            ids = [str(i) for i in (legacy_ids or ())]
+            same = ("((content IN (" + ",".join("?" * len(variants)) + ") AND turn = ?)"
+                    + (" OR (turn IS NULL AND obligation_id IN (" + ",".join("?" * len(ids)) + ")))" if ids else ")"))
+            args = [*variants, turn, *ids]
+        def _do(conn):
+            return conn.execute(
+                """INSERT OR IGNORE INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id,
+                    content, state, attempts, created_at, updated_at,
+                    owner_pid, owner_started_at, adapter_profile, turn)
+                   SELECT ?, ?, ?, ?, ?, ?, 'attempting', 1, ?, ?, ?, ?, ?, ?
+                   WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations WHERE session_key = ? AND """ + same + ")",
+                (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+                 content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+                 turn or '', session_key, *args)).rowcount == 1
+        with translated():
+            return self._obligation_write(_do)
 
     # Sets one row's state and error whatever its owner; the error keeps its first 500 characters.
     def _update_state(self, obligation_id: str, state: str, error: str = "") -> None:

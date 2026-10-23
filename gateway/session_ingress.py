@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 admission_author = ContextVar('admission_author', default=None)
 executing_admission = ContextVar('executing_admission', default=False)
+# KC: the ledger turn tag of the admission this drain is executing (``tag_ledger_turn``). Gateway code
+# that builds a fresh send event inside the turn (the queued first-response lane) tags it from here.
+executing_ledger_turn = ContextVar('executing_ledger_turn', default=None)
 # The live session while the executing turn is one its viewer submitted (``is_viewer_input``), else None.
 viewer_turn: ContextVar = ContextVar('viewer_turn', default=None)
 # Set by a busy-path caller that must be released once its input is durably queued.
@@ -86,6 +89,7 @@ async def admit_message(authority, event):
     authority.native_waiters.add(receipt.admission_id)
     waiter = authority.waiters.setdefault(receipt.admission_id, asyncio.get_running_loop().create_future())
     adopters = _marker_adopters(authority)
+    tag_ledger_turn(authority, event, receipt.admission_id)
     if getattr(event, '_turn_marker_handoff', False):
         # The adapter lifecycle that sends this reply releases the turn's crash marker only once
         # the reply is in the delivery ledger; the drain hands its marker to this event.
@@ -119,6 +123,21 @@ async def admit_message(authority, event):
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+
+
+def tag_ledger_turn(authority, event, admission_id):
+    """KC: every send of this admission's turn is ledgered with its turn tag (the caller's waiting
+    event and the executed copy both send it), so restart recovery tells this turn's own send from
+    another turn's identical reply."""
+    from gateway.session_restart_recovery import ledger_turn
+    tag = ledger_turn(authority.profile_id, admission_id)
+    while event is not None:  # and every event a pre_gateway_dispatch rewrite was made from
+        try:
+            event._kc_ledger_turn = tag
+        except Exception:  # an event that takes no attributes writes '' (never counts as this turn's)
+            logger.debug('ledger turn tag not set', exc_info=True)
+        event = getattr(event, '_rewritten_from', None)
+    return tag
 
 
 def _marker_adopters(authority):
@@ -276,9 +295,11 @@ def pause_notice(authority, ref, reason):
         # Slack registers no native /discard (its slash cap): the umbrella `/hermes discard` reaches it.
         slack = getattr(getattr(live.source, 'platform', None), 'value', None) == 'slack'
         discard = '/hermes discard' if slack else '/discard'
+        # A person's messaging turn normally continues on its own (gateway/session_restart_recovery);
+        # this notice is only reached when that recovery could not commit.
         return ('⏸️ This conversation is paused: a previous turn did not finish when Hermes restarted, '
-                f'and only you know whether to send it again. Your message is saved. Send {discard} to drop '
-                'the lost turn and continue (it is not re-run), or /reset to start a fresh conversation.')
+                f'and Hermes could not pick it up automatically. Your message is saved. Send {discard} '
+                'to drop the lost turn and continue (it is not re-run).')
     cause = f'a queued message could not be re-authorized ({reason})'
     return (f'⏸️ This conversation is paused: {cause}. Your message is saved but will not be answered here. '
             'Send /reset to start a fresh conversation, or ask the operator to resume this one.')
@@ -359,6 +380,7 @@ async def execute_admission(authority, ref, row):
     captured = {}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
+    turn_token = executing_ledger_turn.set(tag_ledger_turn(authority, event, row['admission_id']))
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
@@ -416,6 +438,7 @@ async def execute_admission(authority, ref, row):
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
+        executing_ledger_turn.reset(turn_token)
         execution_result.reset(result_token)
         api_execution.reset(api_token)
         admission_author.reset(author_token)
@@ -567,6 +590,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
+            if getattr(event, '_kc_ledger_turn', None):  # KC: the copy sends this admission's reply
+                delivery_event._kc_ledger_turn = event._kc_ledger_turn
             delivered = await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:
             if not accepted.done():

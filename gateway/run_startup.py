@@ -753,6 +753,7 @@ class GatewayStartupMixin:
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.session_restart_recovery import turn_of_marker
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:
@@ -778,7 +779,8 @@ class GatewayStartupMixin:
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
+                    turn=turn_of_marker(token))
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

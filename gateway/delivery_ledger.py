@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from gateway.dead_targets import classify_dead_error
 from hermes_constants import get_process_hermes_home
@@ -234,20 +234,21 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      turn: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending'); the store prunes old rows
-    in the same write."""
+    in the same write. *turn*: the turn this reply answers (KC: restart recovery's same-turn check)."""
     pid, started = _owner_stamp()
     with _DB_LOCK, _store() as store:
         store.coordination.record_delivery_obligation(
             obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
             thread_id=thread_id, content=content, adapter_profile=adapter_profile,
-            owner=OwnerStamp(pid=pid, started_at=started))
+            owner=OwnerStamp(pid=pid, started_at=started), turn=turn)
 
 
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                             thread_id: Optional[str], content: str, since: float,
-                            adapter_profile: Optional[str] = None) -> None:
+                            adapter_profile: Optional[str] = None, turn: Optional[str] = None) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
@@ -255,7 +256,28 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     with _DB_LOCK, _store() as store:
         store.coordination.record_crash_left_reply(
             obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
-            thread_id=thread_id, content=content, since=since, adapter_profile=adapter_profile)
+            thread_id=thread_id, content=content, since=since, adapter_profile=adapter_profile, turn=turn)
+
+
+def record_recovered_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                           thread_id: Optional[str], content: str, since: float,
+                           adapter_profile: Optional[str] = None, turn: Optional[str] = None,
+                           contents: Optional[Sequence[str]] = None,
+                           legacy_ids: Optional[Sequence[str]] = None) -> bool:
+    """Ledger the saved answer of a person's turn lost across a restart (session restart recovery),
+    owned by THIS process and 'attempting' (a streamed part may be on screen: it goes out once, with
+    the recovered marker). True when inserted: the caller sends it. False when this id or the same
+    reply is already ledgered (in any state): that row, and the sweeps that own it, deliver it; a row
+    is never re-owned, so a sweep mid-send is never doubled. Without *turn*, the same reply is any row
+    of this conversation with this content since *since*; with *turn*, only a row of this turn (tagged
+    with it, or untagged with one of *legacy_ids*): another turn's identical text does not count."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _store() as store:
+        return store.coordination.record_recovered_reply(
+            obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
+            thread_id=thread_id, content=content, since=since, adapter_profile=adapter_profile,
+            owner=OwnerStamp(pid=pid, started_at=started), turn=turn, contents=contents,
+            legacy_ids=legacy_ids)
 
 
 def mark_attempting(obligation_id: str) -> None:

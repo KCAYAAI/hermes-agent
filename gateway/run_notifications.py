@@ -329,7 +329,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # turn's, so the completion path never sees the flag: ledger it now under THIS turn's
             # inbound id, through the same adapter-owned bracket the completion path uses.
             await self._ledger_uncertain_streamed_final(
-                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                _kc_turn_event(MessageEvent(text="", source=source, ledger_message_id=inbound_message_id)),
                 session_key, response, adapter)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
@@ -407,7 +407,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         the base contract and sends without a session key keep the plain send."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
             result, _ = await adapter.send_final_ledgered(
-                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                _kc_turn_event(MessageEvent(text="", source=source, ledger_message_id=inbound_message_id)),
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
@@ -1964,3 +1964,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
                 )
         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)
+
+
+def _kc_turn_event(event):
+    """KC: a send event built inside an admitted turn (the queued first-response lane) carries that
+    turn's ledger tag, like the events ``session_ingress.tag_ledger_turn`` tags."""
+    from gateway.session_ingress import executing_ledger_turn
+    turn = executing_ledger_turn.get()
+    if turn:
+        event._kc_ledger_turn = turn
+    return event
