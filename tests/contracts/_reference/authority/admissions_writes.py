@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Literal, Mapping
 
-from persistence.authority.admissions import ANY_HEAD, AdmissionRecord, CapturedResult, AdmissionGate, ClaimedAdmission, TurnBoundary, raise_gate, steer_replayed
+from persistence.authority.admissions import ANY_HEAD, RECOVERY_ATTEMPTS_PREFIX, RECOVERY_NOTIFIED_PREFIX, RECOVERY_OWED_PREFIX, AdmissionRecord, CapturedResult, AdmissionGate, ClaimedAdmission, TurnBoundary, raise_gate, steer_replayed
 from persistence.authority.vocabulary import STEERING
 from persistence.core.errors import AuthorityRefusal
 
@@ -49,8 +49,9 @@ class AdmissionWritesMixin:
             queued_owner_epoch = first["owner_epoch"]
             entry["generation"] += 1
             state.failpoints.hit(CLAIM_FAILPOINT)
-            first.update(status="started", owner_epoch=epoch, generation=entry["generation"])
-            return rows.claimed(first, rows.max_message_id(staged.scope), queued_owner_epoch)
+            mark = rows.max_message_id(staged.scope)
+            first.update(status="started", owner_epoch=epoch, generation=entry["generation"], transcript_mark=mark)
+            return rows.claimed(first, mark, queued_owner_epoch)
 
     def return_claim(self, *, epoch: int, admission_id: str, generation: int, queued_owner_epoch: int | None) -> AdmissionRecord:
         state = self._state()
@@ -254,6 +255,61 @@ class AdmissionWritesMixin:
             row.update(status="terminal", outcome=outcome)
             rows.bump_revision(authority, target)
             return rows.record(row)
+
+    def recover_unknown(self, *, epoch: int, admission_id: str, generation: int, action: Literal["completed", "requeue", "interrupted"], notice: str | None = None, captured: CapturedResult | None = None, owed: str | None = None) -> tuple[AdmissionRecord, bool]:
+        if action not in ("completed", "requeue", "interrupted"):
+            raise AuthorityRefusal("invalid_params")
+        state = self._state()
+        with state.transaction() as staged:
+            authority = staged.authority
+            state.require_epoch(authority, epoch)
+            row = rows.admission(authority, admission_id)
+            if type(generation) is not int:
+                raise rows.stale("admission", admission_id)
+            if row["status"] != "unknown" or row["generation"] != generation:
+                if row["status"] in ("terminal", "queued", "started"):
+                    return rows.record(row), False
+                raise rows.stale("admission", admission_id)
+            target = row["target_session_id"]
+            if notice is not None:
+                close_discarded_turn(staged.scope, self._turn_target(authority, staged.scope, target), notice)
+            rows.retire_workers(authority, row, row["owner_epoch"])
+            meta = authority["meta"]
+            if action == "requeue":
+                key = RECOVERY_ATTEMPTS_PREFIX + admission_id
+                try:
+                    count = int(meta[key]) + 1 if key in meta else 1
+                except (TypeError, ValueError):
+                    count = 1_000
+                meta[key] = str(count)
+                row.update(status="queued", outcome=None, generation=None)
+            else:
+                outcome = "interrupted"
+                if action == "completed":
+                    if captured is None or captured.outcome not in ("completed", "failed", "interrupted"):
+                        raise AuthorityRefusal("invalid_params")
+                    outcome = captured.outcome
+                    self._store_result(authority, row, dict(captured.result))
+                    if owed is not None:
+                        meta[RECOVERY_OWED_PREFIX + admission_id] = owed
+                row.update(status="terminal", outcome=outcome)
+            rows.bump_revision(authority, target)
+            return rows.record(row), True
+
+    def claim_recovery_notice(self, *, admission_id: str) -> bool:
+        state = self._state()
+        with state.transaction() as staged:
+            meta = staged.authority["meta"]
+            key = RECOVERY_NOTIFIED_PREFIX + admission_id
+            if key in meta:
+                return False
+            meta[key] = str(rows.now())
+            return True
+
+    def clear_recovery_owed(self, *, admission_id: str) -> None:
+        state = self._state()
+        with state.transaction() as staged:
+            staged.authority["meta"].pop(RECOVERY_OWED_PREFIX + admission_id, None)
 
     # Shared lookups
 

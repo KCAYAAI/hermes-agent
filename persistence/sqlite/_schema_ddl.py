@@ -268,6 +268,9 @@ CREATE TABLE IF NOT EXISTS session_admissions (
     outcome TEXT,
     owner_epoch INTEGER,
     generation INTEGER,
+    -- KC: messages.id high-water mark at the claim that started this row (NULL before a claim, or for a row
+    -- claimed before the column existed). Restart recovery ignores transcript rows at or below it.
+    transcript_mark INTEGER,
     UNIQUE (principal_id, target_session_id, request_id),
     CHECK (status != 'started' OR (owner_epoch IS NOT NULL AND generation IS NOT NULL))
 );
