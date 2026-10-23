@@ -75,6 +75,10 @@ async def test_verified_human_root_delivers_images_and_documents():
     ({"ts": TS, "user": "U2", "files": [PDF]}, {"ok": True, "user": {"id": "U2", "is_bot": True}}),
     ({"ts": TS, "user": "U3", "files": [PDF]}, {}),
     ({"ts": TS, "user": "U4", "files": [PDF]}, {"ok": True, "user": {"id": "U4", "deleted": True}}),
+    # Every bot shape the adapter's canonical sender check recognizes (review of #123456).
+    ({"ts": TS, "user": "U5", "bot_profile": {"id": "B5", "name": "wf"}, "files": [PDF]}, _human("U5")),
+    ({"ts": TS, "user": "U6", "app_id": "A6", "files": [PDF]}, _human("U6")),
+    ({"ts": TS, "user": "U8", "user_profile": {"is_bot": True}, "files": [PDF]}, _human("U8")),
 ])
 async def test_unverified_root_sender_loads_no_documents(root, info):
     a = _adapter(root, info)
@@ -107,6 +111,31 @@ async def test_root_document_requires_explicit_authorization_when_check_is_regis
 async def test_authorized_human_root_document_is_recovered():
     a = _adapter({"ts": TS, "user": "U7", "files": [PDF]}, _human("U7"))
     a._authorization_check = lambda *args, **kwargs: True
+    assert await a._collect_thread_root_images(CH, TS, TEAM) == (["/cache/quote.pdf"], ["application/pdf"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel,expected", [("D123", "dm"), ("C123", "group")])
+async def test_root_authorization_uses_the_channel_chat_type(channel, expected):
+    seen = []
+    a = _adapter({"ts": TS, "user": "U7", "files": [PDF]}, _human("U7"))
+    a._thread_context_cache[a._thread_cache_key(channel, TS, TEAM)] = _ThreadContextCache(
+        content="", messages=[{"ts": TS, "user": "U7", "files": [PDF]}])
+
+    def check(user_id, chat_type, chat_id, **kwargs):
+        seen.append(chat_type)
+        return True
+
+    a._authorization_check = check
+    assert await a._collect_thread_root_images(channel, TS, TEAM) == (
+        ["/cache/quote.pdf"], ["application/pdf"])
+    assert seen == [expected]
+
+
+@pytest.mark.asyncio
+async def test_human_app_message_with_client_msg_id_is_still_recovered():
+    root = {"ts": TS, "user": "U1", "app_id": "A1", "client_msg_id": "c1", "files": [PDF]}
+    a = _adapter(root, _human())
     assert await a._collect_thread_root_images(CH, TS, TEAM) == (["/cache/quote.pdf"], ["application/pdf"])
 
 
