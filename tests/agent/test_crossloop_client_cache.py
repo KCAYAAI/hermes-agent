@@ -69,3 +69,54 @@ class TestCrossLoopCacheIsolation:
             "Different event loops got the SAME cached client — this causes "
             "httpx cross-loop deadlocks in gateway mode (#2681)"
         )
+
+
+class _InFlightClient:
+    """A process-transport client (Claude DirectSDK shape): a sync ``close()`` cancels its in-flight requests."""
+
+    def __init__(self):
+        self.api_key, self.base_url, self.closed = "test", "process://test", False
+
+    def close(self):
+        self.closed = True
+
+
+class TestCrossLoopEvictionKeepsInFlightClients:
+    """Parallel tool workers each own a persistent loop (model_tools._run_async), so two concurrent
+    ``vision_analyze`` calls look up the same async key from different live loops. Evicting the other
+    worker's entry must not close its client: that cancels the request it is still awaiting."""
+
+    def _get_on_new_loop(self, loop, out):
+        def run():
+            asyncio.set_event_loop(loop)
+            with patch("agent.auxiliary_client.resolve_provider_client",
+                       side_effect=lambda *a, **k: (_InFlightClient(), "m1")):
+                out.append(_get_cached_client_for_test())
+        t = threading.Thread(target=run)
+        t.start(); t.join()
+
+    def test_live_foreign_loop_client_is_not_closed(self):
+        loop_a, loop_b, got = asyncio.new_event_loop(), asyncio.new_event_loop(), []
+        try:
+            self._get_on_new_loop(loop_a, got)  # worker A: client cached, request in flight
+            self._get_on_new_loop(loop_b, got)  # worker B: same key, different live loop
+            assert got[0] is not got[1]
+            assert not got[0].closed, "evicting a live loop's entry closed a client mid-request"
+        finally:
+            loop_a.close(); loop_b.close()
+
+    def test_closed_owner_loop_client_is_still_closed(self):
+        loop_a, loop_b, got = asyncio.new_event_loop(), asyncio.new_event_loop(), []
+        try:
+            self._get_on_new_loop(loop_a, got)
+            loop_a.close()  # owner gone: nothing can still be awaiting this client
+            self._get_on_new_loop(loop_b, got)
+            assert got[0].closed
+        finally:
+            loop_b.close()
+
+
+def _get_cached_client_for_test():
+    from agent.auxiliary_client import _get_cached_client
+    client, _ = _get_cached_client("custom", "m1", async_mode=True, base_url="http://localhost:8081/v1")
+    return client
