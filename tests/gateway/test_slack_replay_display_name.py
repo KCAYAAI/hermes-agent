@@ -80,6 +80,14 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
         runner.session_store.close_all_db_handles()
         authority.db.close()
 
+    # KC: the adapter drops a thread root's reply-metadata-only message_changed before admission
+    # (_thread_metadata_only_change). Switch that drop off here so this test still exercises the
+    # admission reconcile underneath it; test_slack_reply_metadata_replay_never_reaches_admission
+    # below covers the drop itself.
+    from plugins.platforms.slack import adapter as slack
+    monkeypatch.setattr(slack.SlackAdapter, '_thread_metadata_only_change',
+                        staticmethod(lambda event, updated_message: False))
+
     # Fresh runner, adapter guards, name cache and owner epoch; the same durable home.
     runner, adapter, authority, sent, calls = await _slack_gateway(
         tmp_path, monkeypatch, 'After' if change != 'identical' else 'Before', 'second')
@@ -113,6 +121,51 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
         else:
             assert outcomes == [('admission_conflict', ADMITTED_REQUEST_CONFLICT['field'])]
             assert sent == [ALREADY_ADMITTED_REPLY], 'meaningful conflicts remain visible'
+    finally:
+        runner.session_store.close_all_db_handles()
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_slack_reply_metadata_replay_never_reaches_admission(tmp_path, monkeypatch):
+    """KC: after a restart, the message_changed Slack emits on an answered thread root when a
+    reply lands (reply_count/latest_reply bump, same text) is dropped at the adapter. It is not
+    admitted, so it cannot re-run the root in a newer session or raise a conflict in the same one."""
+    from hermes_state_runtime import list_session_admissions
+
+    original = {'type': 'message', 'channel': DM, 'channel_type': 'im', 'team': TEAM,
+                'user': USER, 'text': TEXT, 'ts': TS, 'event_ts': TS, 'client_msg_id': 'fixture'}
+    runner, adapter, authority, sent, calls = await _slack_gateway(tmp_path, monkeypatch, 'Before', 'first')
+    try:
+        await _deliver(adapter, original)
+        assert calls == [TEXT]
+        session_ids = list(authority.sessions)
+        before = _rows(authority)
+        assert len(before) == 1 and before[0]['status'] == 'terminal'
+    finally:
+        runner.session_store.close_all_db_handles()
+        authority.db.close()
+
+    runner, adapter, authority, sent, calls = await _slack_gateway(tmp_path, monkeypatch, 'After', 'second')
+    admitted = []
+    admit = authority.admit_native
+
+    async def record_admission(event):
+        admitted.append(event)
+        return await admit(event)
+
+    monkeypatch.setattr(authority, 'admit_native', record_admission)
+    message = {**original, 'thread_ts': TS, 'reply_count': 3, 'latest_reply': '1793821177.880909'}
+    replay = {'type': 'message', 'subtype': 'message_changed', 'hidden': True,
+              'channel': DM, 'channel_type': 'im', 'team': TEAM,
+              'ts': '1793821400.000200', 'event_ts': '1793821400.000200', 'message': message}
+    try:
+        await _deliver(adapter, replay)
+        assert admitted == [], 'a reply-metadata bump is not the user speaking'
+        assert calls == [] and sent == []
+        after = [row for sid in session_ids
+                 for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)]
+        assert after == before
     finally:
         runner.session_store.close_all_db_handles()
         authority.db.close()
