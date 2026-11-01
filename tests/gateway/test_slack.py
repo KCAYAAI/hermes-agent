@@ -2309,6 +2309,50 @@ class TestMessageRouting:
         assert msg_event.text == "whats the rapchat summary for last 12 hours"
         assert msg_event.message_id == "1234567890.000001"
 
+    # A thread reply makes Slack re-emit the thread ROOT as ``message_changed`` (reply_count /
+    # latest_reply bump). After a restart the root is no longer in ``_processed_message_ts``, so it
+    # was replayed as a new turn under the root's ts: a duplicate turn when the root's admission row
+    # lives in an older session, ``admission_conflict`` from the Bolt listener when it is in this one.
+
+    @staticmethod
+    def _thread_root_metadata_event(*, with_previous=True, edited=False):
+        root = {
+            "type": "message", "text": "<@U_BOT> please look into the outage",
+            "user": "U_USER", "ts": "1700000000.000100", "thread_ts": "1700000000.000100",
+        }
+        if edited:  # an edit long ago: Slack keeps the marker on every later re-emit
+            root["edited"] = {"user": "U_USER", "ts": "1700000005.000000"}
+        event = {
+            "type": "message", "subtype": "message_changed", "hidden": True,
+            "channel": "C123", "channel_type": "channel", "team": "T123",
+            "ts": "1700000050.000900", "event_ts": "1700000050.000900",
+            "message": dict(root, reply_count=2, latest_reply="1700000050.000800",
+                            reply_users=["U_USER"], reply_users_count=1),
+        }
+        if with_previous:
+            event["previous_message"] = dict(
+                root, reply_count=1, latest_reply="1700000010.000200",
+                reply_users=["U_USER"], reply_users_count=1)
+        return event
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_previous,edited", [(True, False), (True, True), (False, False)])
+    async def test_thread_root_reply_metadata_change_not_replayed_after_restart(
+            self, adapter, with_previous, edited):
+        assert adapter._processed_message_ts == {}  # a fresh process: nothing claimed yet
+        await adapter._handle_slack_message(
+            self._thread_root_metadata_event(with_previous=with_previous, edited=edited))
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_root_text_edit_still_routes(self, adapter):
+        """A real edit of the root (text changed) is still an input, as before."""
+        event = self._thread_root_metadata_event(with_previous=True)
+        event["previous_message"]["text"] = "please look into the outage"
+        event["message"]["edited"] = {"user": "U_USER", "ts": "1700000050.000900"}
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
