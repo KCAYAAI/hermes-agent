@@ -170,6 +170,11 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
+# An ``<index>.lock`` older than the longest index-holding git call (``add -A`` runs with
+# twice the timeout) cannot belong to a live checkpoint git: every index user runs under
+# ``store_lock`` and ``subprocess.run`` reaps a timed-out child before returning.
+_INDEX_LOCK_STALE_SECONDS = _GIT_TIMEOUT * 2 + 30
+
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
@@ -438,6 +443,28 @@ def _git_env(
     return env
 
 
+def _reclaim_orphaned_index_lock(index_file: Path) -> None:
+    """Remove ``<index>.lock`` left by a git that died mid-write (timeout SIGKILL, SIGBUS, OOM).
+
+    git cannot clean up after a fatal signal, and the leftover lock fails every later
+    ``git add -A`` for that project with ``File exists``. Only a lock older than
+    ``_INDEX_LOCK_STALE_SECONDS`` is removed; a younger one is left for git to report.
+    """
+    lock = index_file.with_name(index_file.name + ".lock")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return
+    if age < _INDEX_LOCK_STALE_SECONDS:
+        return
+    try:
+        lock.unlink()
+    except OSError as exc:
+        logger.warning("Could not remove orphaned checkpoint index lock %s: %s", lock, exc)
+        return
+    logger.warning("Removed orphaned checkpoint index lock %s (%.0fs old)", lock, age)
+
+
 def _run_git(
     args: list[str],
     store: Path,
@@ -463,6 +490,8 @@ def _run_git(
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
+    if index_file is not None:
+        _reclaim_orphaned_index_lock(index_file)
     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
     if extra_env:
         env.update(extra_env)
@@ -1063,6 +1092,13 @@ class CheckpointManager:
         # Skip root, home, and other overly broad directories
         if _too_broad(abs_dir):
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+            return False
+
+        # Hermes' cache holds the agents' TMPDIR scratch: concurrent tools create, truncate
+        # and delete files there mid ``git add -A`` (fatal "unable to stat", SIGBUS that
+        # orphans the index lock), and a snapshot of throwaway temp files has no rollback use.
+        if Path(abs_dir).is_relative_to(_normalize_path(str(get_hermes_home() / "cache"))):
+            logger.debug("Checkpoint skipped: Hermes cache/scratch directory (%s)", abs_dir)
             return False
 
         if abs_dir in self._checkpointed_dirs:
