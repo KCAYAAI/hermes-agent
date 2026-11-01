@@ -4651,6 +4651,8 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         original_message_ts = str(updated_message.get("ts") or "")
         if original_message_ts and original_message_ts in self._processed_message_ts:
             return None
+        if self._thread_metadata_only_change(event, updated_message):
+            return None
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
         outer_event_ts = str(event.get("ts") or "")
@@ -4665,6 +4667,25 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
         if changed_event_ts:
             normalized_event["_slack_changed_event_ts"] = changed_event_ts
         return normalized_event
+
+    @staticmethod
+    def _thread_metadata_only_change(event: dict, updated_message: dict) -> bool:
+        """A thread root's ``message_changed`` that only bumps reply metadata (``reply_count``,
+        ``latest_reply``): Slack emits one when a reply lands. It is not the user speaking, and
+        replaying it re-admits the root under its own ts (a duplicate turn, or an
+        ``admission_conflict`` against the root's row). ``previous_message`` decides when present:
+        unchanged text and files is no edit, whatever stale ``edited`` marker the root carries."""
+        if "reply_count" not in updated_message and "latest_reply" not in updated_message:
+            return False
+
+        def body(message: dict) -> tuple:
+            files = message.get("files") or []
+            return (message.get("text"), [f.get("id") if isinstance(f, dict) else f for f in files])
+
+        previous = event.get("previous_message")
+        if isinstance(previous, dict):
+            return body(previous) == body(updated_message)
+        return not isinstance(updated_message.get("edited"), dict)
 
     @staticmethod
     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
