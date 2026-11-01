@@ -5100,6 +5100,52 @@ class TestNativeTaskCardProgress:
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio
+    async def test_reaped_stream_reopens_a_fresh_card_without_deleting_the_gone_one(
+        self, adapter
+    ):
+        """Slack can also REAP an expired native stream: the next chat.appendStream fails
+        with message_not_found (the card message no longer exists). Live KC gateway,
+        2026-10-27..11-01: every one of those was reported as a retryable failure, so a live
+        card retried the dead ts every <=10 s until the turn ended (up to 49 ERROR+WARNING
+        pairs per turn) and the user saw no card for the rest of the turn. Recover exactly
+        like the sealed case — fresh card, full projection — but do not chat.delete a
+        message Slack already removed. Upstream: #137799 / PR #137803."""
+        client = adapter._app.client
+        starts = 0
+
+        async def api_call(method, *, json):
+            nonlocal starts
+            if method == "chat.startStream":
+                starts += 1
+                return {"ts": f"stream-{starts}"}
+            if method == "chat.appendStream" and json["ts"] == "stream-1" and starts == 1 and json["chunks"][1]["status"] == "complete":
+                raise _StreamExpiredError("reaped", {"ok": False, "error": "message_not_found"})
+            return {"ok": True}
+
+        client.api_call.side_effect = api_call
+        metadata = {"thread_id": "thread-1"}
+        running = [{"id": "call-1", "title": "terminal", "status": "in_progress"}]
+        done = [
+            {"id": "call-1", "title": "terminal", "status": "complete"},
+            {"id": "call-2", "title": "web_search", "status": "in_progress"},
+        ]
+
+        await adapter.send_native_task_card_progress("C1", running, metadata=metadata)
+        second = await adapter.send_native_task_card_progress("C1", done, metadata=metadata)
+
+        assert second.success is True and second.message_id == "stream-2"
+        methods = [(c.args[0], c.kwargs["json"].get("ts")) for c in client.api_call.await_args_list]
+        assert methods == [
+            ("chat.startStream", None),
+            ("chat.appendStream", "stream-1"),
+            ("chat.appendStream", "stream-1"),  # rejected: reaped
+            ("chat.startStream", None),
+            ("chat.appendStream", "stream-2"),
+        ]  # no chat.delete: the reaped card is already gone
+        (stream,) = adapter._native_task_card_streams.values()
+        assert stream.stream_ts == "stream-2" and stream.stopped is False
+
+    @pytest.mark.asyncio
     async def test_expired_stream_reopen_gives_up_after_one_retry(self, adapter):
         """A reopened card that is itself rejected as not-streaming is a real
         failure, not a loop: one reopen per update, then the failure surfaces."""
