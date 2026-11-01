@@ -2137,25 +2137,36 @@ class SlackAdapter(SlackSocketLifecycleMixin, BasePlatformAdapter):
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 except Exception as exc:
-                    if not _slack_error_is(exc, "message_not_in_streaming_state"):
+                    reaped = _slack_error_is(exc, "message_not_found")
+                    if not (reaped or _slack_error_is(exc, "message_not_in_streaming_state")):
                         raise
-                    # Slack seals a native stream server-side after a few minutes of a long
+                    # Slack ends a native stream server-side after a few minutes of a long
                     # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure.
+                    # documented). Sealed (message_not_in_streaming_state): the message is a
+                    # regular message now. Reaped (message_not_found): Slack deleted it
+                    # (upstream #137799 / PR #137803). Either way reopen a fresh card in the
+                    # same thread. Every frame already carries the FULL visible projection, so
+                    # nothing is lost; the user sees the card continue instead of degrading to
+                    # text bubbles. One reopen per update: a second rejection is a real failure.
+                    if stream.retired:
+                        # Abandoned while this update was in flight: the turn moved on, so the
+                        # expired card is not replaced (nothing would track or stop a new one).
+                        return SendResult(success=False, error="Progress stream already stopped")
                     logger.info(
-                        "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
-                        "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
+                        "[Slack] Native task-card stream %s expired (%s); "
+                        "reopening a fresh card in thread %s", stream.stream_ts,
+                        "message_not_found" if reaped else "message_not_in_streaming_state",
+                        stream.thread_ts)
                     sealed_ts, stream.stream_ts = stream.stream_ts, ""
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                    if not await self._start_task_card(client, stream, metadata):
+                        return SendResult(success=False, error="Progress stream already stopped")
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                     # One card per turn: the new card now carries the full projection, so the
                     # sealed one is a stale duplicate. Delete it only after its replacement is live.
-                    await self._delete_sealed_task_card(client, chat_id, sealed_ts)
+                    # A reaped card is already gone: nothing to delete.
+                    if not reaped:
+                        await self._delete_sealed_task_card(client, chat_id, sealed_ts)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
                 _task = asyncio.current_task()
