@@ -5844,9 +5844,11 @@ def _get_cached_client(
             )
             if loop_ok:
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            # Stale async entry — evict. Only a closed owner loop's client is closed here. A live
+            # foreign loop (a parallel tool worker) may be mid-request on it, and closing cancels that
+            # request, so drop the reference only, like the FIFO eviction below.
+            if cached_loop is not None and cached_loop.is_closed():
+                _close_cached_client(cached_client, close_async=True)
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
@@ -5878,10 +5880,23 @@ def _get_cached_client(
                     del _client_cache[next(iter(_client_cache))]
                 _client_cache[cache_key] = (client, default_model, current_loop)
             else:
-                built_client = client
-                client, default_model, _ = _client_cache[cache_key]
-                # Race loser was never exposed to a caller — safe to close now.
-                _close_cached_client(built_client, close_async=async_mode)
+                cached_client, cached_default, cached_loop = _client_cache[cache_key]
+                if async_mode and cached_loop is not current_loop:
+                    # KC: another loop won the insertion race. Its client is bound to that loop, so this
+                    # caller keeps the client it built. A closed owner loop's entry is stale: close it and
+                    # cache ours, as the hit path does. An unknown owner (no loop) is not a closed one: its
+                    # client was already returned to a caller, so replace the entry without closing it,
+                    # as the hit path drops it. A live foreign loop may be mid-request on its entry, so it
+                    # stays cached and ours is returned uncached.
+                    if cached_loop is None or cached_loop.is_closed():
+                        if cached_loop is not None:
+                            _close_cached_client(cached_client, close_async=True)
+                        _client_cache[cache_key] = (client, default_model, current_loop)
+                else:
+                    built_client = client
+                    client, default_model = cached_client, cached_default
+                    # Race loser was never exposed to a caller — safe to close now.
+                    _close_cached_client(built_client, close_async=async_mode)
     return client, _compat_model(client, model, default_model)
 
 
