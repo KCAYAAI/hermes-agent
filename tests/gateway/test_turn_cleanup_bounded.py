@@ -608,6 +608,105 @@ async def test_start_that_returns_after_abandon_takes_its_card_down():
     assert calls == [("chat.startStream", None), ("chat.stopStream", "S1"), ("chat.delete", "S1")]
 
 
+@pytest.mark.asyncio
+async def test_expired_card_is_not_reopened_after_abandon():
+    """An update in flight when its stream was abandoned comes back message_not_found (the card
+    is gone). The adapter must not open a replacement card for a turn that has moved on."""
+    adapter = _slack_adapter()
+    entered, release, starts, appends = asyncio.Event(), asyncio.Event(), [], []
+
+    async def api_call(method, *, json):
+        if method == "chat.startStream":
+            starts.append(1)
+            return {"ts": f"S{len(starts)}"}
+        if method == "chat.appendStream":
+            appends.append(json["ts"])
+            if len(appends) == 2:
+                entered.set()
+                await release.wait()
+                raise _SlackShapedError("message_not_found")
+        return {"ok": True}
+
+    adapter._app.client.api_call.side_effect = api_call
+    meta = {"thread_id": "1.0"}
+    tasks = [{"id": "1", "title": "x"}]
+    assert (await adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A")).success
+    task = asyncio.create_task(adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A"))
+    await entered.wait()
+    assert adapter.abandon_native_task_card_progress("C1", metadata=meta, owner="A") == ["S1"]
+    release.set()
+    r = await asyncio.wait_for(task, 2)
+    assert not r.success
+    assert len(starts) == 1 and appends == ["S1", "S1"]  # no second card, no frame to one
+
+
+@pytest.mark.asyncio
+async def test_reopen_start_that_returns_after_abandon_takes_its_card_down():
+    """The same at the second start site: an update found its card expired and the start of the
+    replacement was in flight when the stream was abandoned. The replacement gets no frame and is
+    taken down."""
+    adapter = _slack_adapter()
+    entered, release, calls = asyncio.Event(), asyncio.Event(), []
+
+    async def api_call(method, *, json):
+        calls.append((method, json.get("ts")))
+        if method == "chat.startStream":
+            if len([c for c in calls if c[0] == "chat.startStream"]) == 1:
+                return {"ts": "S1"}
+            entered.set()
+            await release.wait()
+            return {"ts": "S2"}
+        if method == "chat.appendStream" and len([c for c in calls if c[0] == "chat.appendStream"]) == 2:
+            raise _SlackShapedError("message_not_found")
+        return {"ok": True}
+
+    adapter._app.client.api_call.side_effect = api_call
+    meta = {"thread_id": "1.0"}
+    tasks = [{"id": "1", "title": "x"}]
+    assert (await adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A")).success
+    task = asyncio.create_task(adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A"))
+    await entered.wait()
+    assert adapter.abandon_native_task_card_progress("C1", metadata=meta, owner="A") == ["S1"]
+    release.set()
+    r = await asyncio.wait_for(task, 2)
+    assert not r.success
+    await _disposals_done(adapter)
+    assert calls[-2:] == [("chat.stopStream", "S2"), ("chat.delete", "S2")]
+    assert ("chat.appendStream", "S2") not in calls
+
+
+@pytest.mark.asyncio
+async def test_expired_card_is_still_reopened_when_only_its_message_was_deleted():
+    """``stopped`` is also set when the card's message is deleted (two sessions in one thread: the
+    other one's cleanup removed the shared card). That turn has not given the stream up, so an
+    update that then finds the card gone reopens one, as on live. Only abandon retires a stream."""
+    adapter = _slack_adapter()
+    entered, release, starts = asyncio.Event(), asyncio.Event(), []
+
+    async def api_call(method, *, json):
+        if method == "chat.startStream":
+            starts.append(1)
+            return {"ts": f"S{len(starts)}"}
+        if method == "chat.appendStream" and json["ts"] == "S1" and len(starts) == 1 and entered.is_set() is False and armed:
+            entered.set()
+            await release.wait()
+            raise _SlackShapedError("message_not_found")
+        return {"ok": True}
+
+    adapter._app.client.api_call.side_effect = api_call
+    meta = {"thread_id": "1.0"}
+    tasks = [{"id": "1", "title": "x"}]
+    armed = False
+    assert (await adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A")).success
+    armed = True
+    task = asyncio.create_task(adapter.send_native_task_card_progress("C1", tasks, metadata=meta, owner="A"))
+    await entered.wait()
+    adapter._forget_native_task_card("C1", "S1")
+    release.set()
+    r = await asyncio.wait_for(task, 2)
+    assert r.success and r.message_id == "S2" and len(starts) == 2
+
+
 def test_abandon_keeps_the_retired_cards_id_for_cleanup():
     runner, ctx = _cleanup_runner(), _turn_ctx()
     ctx._cleanup_progress = True
