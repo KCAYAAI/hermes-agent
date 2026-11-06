@@ -211,7 +211,9 @@ async def test_non_admin_reasoning_session_only(monkeypatch):
     reply = await runner._handle_reasoning_command(_event("/reasoning high"))
     assert "⛔" not in reply
     assert saved == []
-    assert any((v or {}).get("effort") == "high" for v in runner._session_reasoning_overrides.values())
+    # Read the override from SessionState: upstream removed the legacy _session_reasoning_overrides dict view.
+    overrides = [s.conversation.reasoning_override for s in (runner.__dict__.get("_sessions") or {}).values()]
+    assert any((v or {}).get("effort") == "high" for v in overrides)
 
 
 @pytest.mark.asyncio
