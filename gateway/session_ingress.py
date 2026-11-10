@@ -202,13 +202,37 @@ def _take_post_delivery(authority, admission_id, source, route):
         _registry(authority, 'post_delivery')[admission_id] = (slots, route, entry)
 
 
+def _give_waiter_post_delivery(authority, admission_id, source, route):
+    """A native waiter (the adapter task that waited for this turn) sends the reply and then runs the
+    turn's post-delivery callbacks. Move the slot onto the event that task holds, now, while the slot
+    can only hold this turn's entry. Left on the adapter it was lost whenever a follow-up was waiting:
+    the drain runs the chat's next turn while the reply is still being sent, and that turn registers in
+    the same slot (a newer generation replaces the entry) and stamps its generation on the shared
+    interrupt Event (the waiter's generation-checked pop then matches nothing). A waiter with no
+    adopting event keeps the slot where it was."""
+    adopter = _marker_adopters(authority).get(admission_id)
+    if adopter is None:
+        return
+    resolve = getattr(authority.runner, '_adapter_for_source', None)
+    slots = getattr(resolve(source), '_post_delivery_callbacks', None) if resolve and source else None
+    if slots is not None:
+        from gateway.platforms.base import HANDED_POST_DELIVERY
+        setattr(adopter, HANDED_POST_DELIVERY, slots.pop(route, None))
+
+
 def _hand_back_post_delivery(authority, admission_id):
     """A native waiter registered after the turn started: its adapter task sends the reply and then
-    runs the slot, which goes back unless a newer turn's already took it."""
+    runs the slot. It goes onto the waiter's event (``_give_waiter_post_delivery``); with no adopting
+    event it goes back to the adapter unless a newer turn's already took the slot."""
     taken = _registry(authority, 'post_delivery').pop(admission_id, None)
     if taken is not None:
         slots, route, entry = taken
-        slots.setdefault(route, entry)
+        adopter = _marker_adopters(authority).get(admission_id)
+        if adopter is not None:
+            from gateway.platforms.base import HANDED_POST_DELIVERY
+            setattr(adopter, HANDED_POST_DELIVERY, entry)
+        else:
+            slots.setdefault(route, entry)
 
 
 async def fire_post_delivery(authority, admission_id):
@@ -390,6 +414,8 @@ async def execute_admission(authority, ref, row):
             # No adapter task awaits this turn to run its post-delivery callbacks: the drain runs them
             # once the turn settled and its reply went out (``fire_post_delivery``).
             _take_post_delivery(authority, row['admission_id'], event.source, route)
+        else:
+            _give_waiter_post_delivery(authority, row['admission_id'], event.source, route)
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
@@ -482,22 +508,29 @@ async def deliver_settled(authority, admission_id):
             authority, admission_id, ProcessingOutcome.SUCCESS if delivered else ProcessingOutcome.FAILURE)
 
 
-async def deliver_response(adapter, event, session_key, response):
+async def deliver_response(adapter, event, session_key, response, *, results=None):
     """Send a turn's reply; whether it was delivered (``_process_message_background``'s verdict:
-    nothing to send, or at least one send that succeeded)."""
+    nothing to send, or at least one send that succeeded). ``results`` collects each send's result
+    for a caller that also needs to know whether the WHOLE reply went out."""
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
         return True
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
-    results = []
+    results = [] if results is None else results
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
                                        metadata, ttl > 0, ttl, results.append)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
                                        record_delivery=results.append)
     return any(getattr(result, 'success', False) for result in results if result is not None)
+
+
+def _every_send_complete(results):
+    """``_process_message_background``'s verdict for the whole reply: no send failed or was partial."""
+    return all(getattr(result, 'success', False) and getattr(result, 'error_kind', None) != 'partial'
+               for result in results if result is not None)
 
 
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
@@ -518,12 +551,14 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
         # Like the first message's lifecycle, this sender adopts the turn's crash marker and
         # releases it only once the reply is ledgered (the marker moves onto ``event``).
         event._turn_marker_handoff = getattr(adapter, 'gateway_runner', None) is not None
+        complete, sends = False, []
         try:
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
-            await deliver_response(adapter, delivery_event, session_key, response)
+            delivered = await deliver_response(adapter, delivery_event, session_key, response, results=sends)
+            complete = bool(delivered) and _every_send_complete(sends)
         except Exception as exc:
             if not accepted.done():
                 raise  # nothing was queued: the receive loop sees the failure as before
@@ -535,6 +570,12 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
+            # This task sent the follow-up's reply, so it runs the turn's post-delivery callbacks, as
+            # ``_process_message_background`` does for a first message. Never run, a follow-up's
+            # progress card was never removed and its background-review notes were never released.
+            run_post_delivery = getattr(adapter, 'run_turn_post_delivery', None)
+            if run_post_delivery is not None:
+                await run_post_delivery(event, session_key, None, complete)
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:
