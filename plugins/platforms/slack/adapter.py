@@ -1136,6 +1136,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Native progress streams; each owns a lock so concurrent start/append/stop
         # can't create duplicates or append after finalization.
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
+        # (channel, ts) -> workspace of each working card this adapter opened whose stream it has not
+        # seen closed and whose message it has not seen deleted. delete_message closes the stream
+        # before deleting only for these, with the client that opened it. An entry leaves when the
+        # card is closed or deleted, so what stays is a card a stuck stop left open; none is evicted.
+        self._native_task_card_ts: dict[tuple[str, str], str] = {}
         # Request reactions (👀/✅/❌) are owned by one durable ledger; see reaction_ledger.py.
         self._reactions = _rl.ReactionLedger(self)
         # id(event) -> [event, open turns, (team, ts, thread)]: tells a re-reported completion
@@ -2128,6 +2133,9 @@ class SlackAdapter(BasePlatformAdapter):
                 client = self._get_client(chat_id, team_id=stream.team_id)
                 if not stream.stream_ts:
                     await self._start_native_task_card_stream(client, stream, metadata)
+                    if stream.stopped:
+                        return self._discard_late_task_card(client, stream)
+                    self._remember_native_task_card(stream)
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2148,6 +2156,15 @@ class SlackAdapter(BasePlatformAdapter):
                     # same thread. Every frame already carries the FULL visible projection, so
                     # nothing is lost; the user sees the card continue instead of degrading to
                     # text bubbles. One reopen per update: a second rejection is a real failure.
+                    # Slack closed that stream itself: a later delete of it needs no stopStream.
+                    self._lazy_attr("_native_task_card_ts", dict).pop((stream.channel, stream.stream_ts), None)
+                    if stream.stopped:
+                        # Retired while this update was in flight: bounded turn cleanup gave up on a
+                        # stuck card (abandon_native_task_card_progress). The turn is over, so a
+                        # fresh card would be opened after its cleanup was scheduled and nothing
+                        # would ever close or remove it.
+                        return SendResult(success=False, error="Progress stream already stopped",
+                                          retryable=False)
                     logger.info(
                         "[Slack] Native task-card stream %s expired (%s); "
                         "reopening a fresh card in thread %s", stream.stream_ts,
@@ -2155,6 +2172,9 @@ class SlackAdapter(BasePlatformAdapter):
                         stream.thread_ts)
                     sealed_ts, stream.stream_ts = stream.stream_ts, ""
                     await self._start_native_task_card_stream(client, stream, metadata)
+                    if stream.stopped:
+                        return self._discard_late_task_card(client, stream)
+                    self._remember_native_task_card(stream)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                     # One card per turn: the new card now carries the full projection, so the
@@ -2179,6 +2199,33 @@ class SlackAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"startStream outcome unknown: {exc}",
                                       retryable=False)
                 return SendResult(success=False, error=str(exc), retryable=True)
+
+    def _remember_native_task_card(self, stream: _NativeTaskCardStream) -> None:
+        if stream.stream_ts:
+            self._lazy_attr("_native_task_card_ts", dict)[(stream.channel, stream.stream_ts)] = stream.team_id
+
+    def _discard_late_task_card(self, client, stream: _NativeTaskCardStream) -> SendResult:
+        """startStream returned after bounded turn cleanup retired this stream
+        (abandon_native_task_card_progress). The turn has ended and its cleanup cannot know this
+        card's ts, so close and delete it here, on a task of its own: the caller is a detached,
+        cancelled updater. No card is reported, so the updater tracks nothing."""
+        task = asyncio.get_running_loop().create_task(
+            self._remove_late_task_card(client, stream.channel, stream.stream_ts))
+        tasks = self._lazy_attr("_background_tasks", set)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return SendResult(success=False, error="Progress stream already stopped", retryable=False)
+
+    @staticmethod
+    async def _remove_late_task_card(client, chat_id: str, ts: str) -> None:
+        for method in ("chat.stopStream", "chat.delete"):
+            try:
+                await client.api_call(method, json={"channel": chat_id, "ts": ts})
+            except Exception as exc:
+                if method == "chat.delete" and not _slack_error_is(exc, "message_not_found"):
+                    logger.warning(
+                        "[Slack] Working card %s in channel %s opened after its turn had ended and "
+                        "could not be removed (%s); it stays in the thread", ts, chat_id, exc)
 
     @staticmethod
     async def _delete_sealed_task_card(client, chat_id: str, ts: str) -> None:
@@ -2240,6 +2287,8 @@ class SlackAdapter(BasePlatformAdapter):
                 if self._app and stream.stream_ts:
                     await self._get_client(stream.channel, team_id=stream.team_id).api_call(
                         "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
+                    # Closed: a later delete needs no stopStream.
+                    self._lazy_attr("_native_task_card_ts", dict).pop((stream.channel, stream.stream_ts), None)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
             finally:
@@ -2266,17 +2315,21 @@ class SlackAdapter(BasePlatformAdapter):
 
     def abandon_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> None:
+        metadata: Optional[dict[str, Any]] = None, owner: Optional[str] = None) -> Optional[str]:
         """Retire this turn's card stream WITHOUT network I/O (its updater is stuck). The next
-        turn in the thread opens a fresh card instead of queueing behind the stuck lock."""
+        turn in the thread opens a fresh card instead of queueing behind the stuck lock.
+
+        Returns the ts of the card it leaves open, if one exists: the caller's cleanup list has that
+        id only once a send returned it, and the stuck update may be the card's first."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
-            return
+            return None
         stream = self._native_task_card_streams.get(key)
         if stream is None or (owner and stream.owner and stream.owner != owner):
-            return
+            return None
         stream.stopped = True
         self._native_task_card_streams.pop(key, None)
+        return stream.stream_ts or None
 
     def _suppressed_ignored(self, chat_id: str, what: str, *, level: int = logging.WARNING) -> bool:
         """True (after logging) when ``chat_id`` is a configured ignored channel."""
@@ -2539,34 +2592,59 @@ class SlackAdapter(BasePlatformAdapter):
             if cached == str(message_id) and key[0] == str(chat_id):
                 self._status_message_ids.pop(key, None)
 
-    def _forget_native_task_card(self, chat_id: str, message_id: str) -> None:
+    def _forget_native_task_card(self, chat_id: str, message_id: str, team_id: Optional[str] = None) -> None:
         """Retire a task-card stream whose message was just deleted. A cancelled turn can skip
         stop_native_task_card_progress, so without this the next turn in the thread appends to a
-        deleted ts (message_not_found) and every card update degrades to text bubbles."""
+        deleted ts (message_not_found) and every card update degrades to text bubbles. With
+        ``team_id`` (the workspace that opened the deleted card) only that workspace's stream."""
         for key, stream in list(self._native_task_card_streams.items()):
-            if stream.channel == str(chat_id) and stream.stream_ts == str(message_id):
+            if (stream.channel == str(chat_id) and stream.stream_ts == str(message_id)
+                    and (not team_id or stream.team_id == team_id)):
                 stream.stopped = True
                 self._native_task_card_streams.pop(key, None)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
-        """Delete a bot message (used to clean up temporary progress bubbles)."""
+        """Delete a bot message (used to clean up temporary progress bubbles and the working card).
+
+        Slack refuses to delete a message whose native stream is still open (``cant_delete_message``,
+        probed live 2026-11-10). That is a working card whose stopStream never completed: bounded
+        turn cleanup detaches a stuck stop and retires the stream without a network call. For a card
+        this adapter opened, the stream is closed here and the delete repeated once, through the
+        client of the workspace that opened it. A message that is already gone
+        (``message_not_found``: a sealed card deleted when its replacement opened) counts as deleted."""
         if not self._app:
             return False
         # Whatever the outcome, a deleted (or undeletable) bubble must not be edited next turn.
         self._forget_status_message(chat_id, message_id)
-        try:
-            response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
-            if not (hasattr(response, "get") and response.get("ok") is False):
-                self._forget_native_task_card(chat_id, message_id)
+        cards, card = self._lazy_attr("_native_task_card_ts", dict), (str(chat_id), str(message_id))
+        client = self._get_client(chat_id, team_id=cards.get(card))
+        for closed_stream in (False, True):
+            error = await self._delete_message_once(client, chat_id, message_id)
+            if error in (None, "message_not_found"):
+                self._forget_native_task_card(chat_id, message_id, cards.pop(card, None))
                 return True
-            logger.debug(
-                "[Slack] chat.delete returned ok=false for message %s in channel %s: %s",
-                message_id, chat_id, response.get("error", "unknown"))
-            return False
-        except Exception as e:  # pragma: no cover - best-effort cleanup
-            logger.debug(
-                "[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, e)
-            return False
+            if error != "cant_delete_message" or closed_stream or card not in cards:
+                break
+            try:
+                await client.api_call("chat.stopStream", json={"channel": chat_id, "ts": message_id})
+            except Exception as exc:
+                logger.debug("[Slack] stopStream before deleting %s failed: %s", message_id, exc)
+        logger.debug("[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, error)
+        return False
+
+    @staticmethod
+    async def _delete_message_once(client, chat_id: str, message_id: str) -> Optional[str]:
+        """One chat.delete: None when it succeeded, else Slack's error code (or the exception text)."""
+        try:
+            response = await client.chat_delete(channel=chat_id, ts=message_id)
+        except Exception as exc:
+            code = None
+            with contextlib.suppress(Exception):
+                code = (getattr(exc, "response", None) or {}).get("error")
+            return str(code or exc or type(exc).__name__)
+        if hasattr(response, "get") and response.get("ok") is False:
+            return str(response.get("error") or "unknown")
+        return None
 
     # Native streaming (chat.startStream/appendStream/stopStream). Unlike Telegram drafts a Slack
     # stream IS the final message: ``send()`` seals it instead of posting a duplicate. Needs the
