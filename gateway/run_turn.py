@@ -51,6 +51,8 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 _STREAMED_EDIT_TIMEOUT_S = 15.0
+# Pauses before the 2nd and 3rd attempt to delete a temporary progress message after the final reply.
+_CLEANUP_DELETE_RETRY_PAUSES_S = (2.0, 8.0)
 _STREAM_FLUSH_TIMEOUT_S = 5.0
 
 _tool_call_logger_lock = threading.Lock()
@@ -2033,7 +2035,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             return
-        _ids_snapshot = list(_cleanup_msg_ids)
         _chat_id_snapshot = turn_ctx.source.chat_id
         _loop_snapshot = asyncio.get_running_loop()
 
@@ -2047,9 +2048,28 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 return
 
             async def _delete_all() -> None:
-                for _mid in _ids_snapshot:
-                    with suppress(Exception):
-                        await _cleanup_adapter.delete_message(_chat_id_snapshot, _mid)
+                # The live list, read now: a card reopened while the turn was closing was tracked
+                # after this cleanup was scheduled. A delete that fails (a network stall, a card
+                # whose stream Slack still held open) is retried a bounded number of times; what is
+                # still there afterwards is reported, because it stays in the thread.
+                _left = list(dict.fromkeys(_cleanup_msg_ids))
+                for _pause in (0.0, *_CLEANUP_DELETE_RETRY_PAUSES_S):
+                    if _pause:
+                        await asyncio.sleep(_pause)
+                    _failed = []
+                    for _mid in _left:
+                        _deleted = False
+                        with suppress(Exception):
+                            _deleted = await _cleanup_adapter.delete_message(_chat_id_snapshot, _mid) is not False
+                        if not _deleted:
+                            _failed.append(_mid)
+                    _left = _failed
+                    if not _left:
+                        return
+                logger.warning(
+                    "Could not remove %d temporary progress message(s) after the final reply "
+                    "(session=%s chat=%s ids=%s); they stay in the conversation",
+                    len(_left), session_key, _chat_id_snapshot, ",".join(map(str, _left)))
             with suppress(Exception):
                 safe_schedule_threadsafe(
                     _delete_all(), _loop_snapshot, logger=logger,

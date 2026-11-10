@@ -1136,6 +1136,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Native progress streams; each owns a lock so concurrent start/append/stop
         # can't create duplicates or append after finalization.
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
+        # (channel, ts) of the working cards this adapter opened, oldest first, bounded.
+        # delete_message closes a stream before deleting it only for these.
+        self._native_task_card_ts: dict[tuple[str, str], None] = {}
         # Request reactions (👀/✅/❌) are owned by one durable ledger; see reaction_ledger.py.
         self._reactions = _rl.ReactionLedger(self)
         # id(event) -> [event, open turns, (team, ts, thread)]: tells a re-reported completion
@@ -2128,6 +2131,7 @@ class SlackAdapter(BasePlatformAdapter):
                 client = self._get_client(chat_id, team_id=stream.team_id)
                 if not stream.stream_ts:
                     await self._start_native_task_card_stream(client, stream, metadata)
+                    self._remember_native_task_card(chat_id, stream.stream_ts)
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2148,6 +2152,13 @@ class SlackAdapter(BasePlatformAdapter):
                     # same thread. Every frame already carries the FULL visible projection, so
                     # nothing is lost; the user sees the card continue instead of degrading to
                     # text bubbles. One reopen per update: a second rejection is a real failure.
+                    if stream.stopped:
+                        # Retired while this update was in flight: bounded turn cleanup gave up on a
+                        # stuck card (abandon_native_task_card_progress). The turn is over, so a
+                        # fresh card would be opened after its cleanup was scheduled and nothing
+                        # would ever close or remove it.
+                        return SendResult(success=False, error="Progress stream already stopped",
+                                          retryable=False)
                     logger.info(
                         "[Slack] Native task-card stream %s expired (%s); "
                         "reopening a fresh card in thread %s", stream.stream_ts,
@@ -2155,6 +2166,7 @@ class SlackAdapter(BasePlatformAdapter):
                         stream.thread_ts)
                     sealed_ts, stream.stream_ts = stream.stream_ts, ""
                     await self._start_native_task_card_stream(client, stream, metadata)
+                    self._remember_native_task_card(chat_id, stream.stream_ts)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                     # One card per turn: the new card now carries the full projection, so the
@@ -2179,6 +2191,17 @@ class SlackAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"startStream outcome unknown: {exc}",
                                       retryable=False)
                 return SendResult(success=False, error=str(exc), retryable=True)
+
+    _NATIVE_TASK_CARD_TS_KEPT = 512
+
+    def _remember_native_task_card(self, chat_id: str, ts: str) -> None:
+        if not ts:
+            return
+        cards, key = self._native_task_card_ts, (str(chat_id), str(ts))
+        cards.pop(key, None)
+        cards[key] = None
+        while len(cards) > self._NATIVE_TASK_CARD_TS_KEPT:
+            cards.pop(next(iter(cards)))
 
     @staticmethod
     async def _delete_sealed_task_card(client, chat_id: str, ts: str) -> None:
@@ -2549,24 +2572,48 @@ class SlackAdapter(BasePlatformAdapter):
                 self._native_task_card_streams.pop(key, None)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
-        """Delete a bot message (used to clean up temporary progress bubbles)."""
+        """Delete a bot message (used to clean up temporary progress bubbles and the working card).
+
+        Slack refuses to delete a message whose native stream is still open (``cant_delete_message``,
+        probed live 2026-11-10). That is a working card whose stopStream never completed: bounded
+        turn cleanup detaches a stuck stop and retires the stream without a network call. For a card
+        this adapter opened, the stream is closed here and the delete repeated once. A message that
+        is already gone (``message_not_found``: a sealed card deleted when its replacement opened)
+        counts as deleted."""
         if not self._app:
             return False
         # Whatever the outcome, a deleted (or undeletable) bubble must not be edited next turn.
         self._forget_status_message(chat_id, message_id)
-        try:
-            response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
-            if not (hasattr(response, "get") and response.get("ok") is False):
+        client = self._get_client(chat_id)
+        cards, card = getattr(self, "_native_task_card_ts", {}), (str(chat_id), str(message_id))
+        for closed_stream in (False, True):
+            error = await self._delete_message_once(client, chat_id, message_id)
+            if error in (None, "message_not_found"):
                 self._forget_native_task_card(chat_id, message_id)
+                cards.pop(card, None)
                 return True
-            logger.debug(
-                "[Slack] chat.delete returned ok=false for message %s in channel %s: %s",
-                message_id, chat_id, response.get("error", "unknown"))
-            return False
-        except Exception as e:  # pragma: no cover - best-effort cleanup
-            logger.debug(
-                "[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, e)
-            return False
+            if error != "cant_delete_message" or closed_stream or card not in cards:
+                break
+            try:
+                await client.api_call("chat.stopStream", json={"channel": chat_id, "ts": message_id})
+            except Exception as exc:
+                logger.debug("[Slack] stopStream before deleting %s failed: %s", message_id, exc)
+        logger.debug("[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, error)
+        return False
+
+    @staticmethod
+    async def _delete_message_once(client, chat_id: str, message_id: str) -> Optional[str]:
+        """One chat.delete: None when it succeeded, else Slack's error code (or the exception text)."""
+        try:
+            response = await client.chat_delete(channel=chat_id, ts=message_id)
+        except Exception as exc:
+            code = None
+            with contextlib.suppress(Exception):
+                code = (getattr(exc, "response", None) or {}).get("error")
+            return str(code or exc or type(exc).__name__)
+        if hasattr(response, "get") and response.get("ok") is False:
+            return str(response.get("error") or "unknown")
+        return None
 
     # Native streaming (chat.startStream/appendStream/stopStream). Unlike Telegram drafts a Slack
     # stream IS the final message: ``send()`` seals it instead of posting a duplicate. Needs the
