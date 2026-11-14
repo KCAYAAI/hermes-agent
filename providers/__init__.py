@@ -63,7 +63,11 @@ _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 # Bumped by every registration (process-wide or per-home layer): memos over the registry key on it.
 _REGISTRY_GENERATION = 0
 _discovered = False
-_discovering = False
+# Scans in flight (bundled discovery, or any thread's home-layer scan); truthy while one runs. A count, not
+# a flag each scan saves and restores: two turn threads scanning two homes restored it in the wrong order
+# and left it set for the life of the process.
+_discovering = 0
+_DISCOVERING_LOCK = threading.Lock()
 _PLUGIN_DIR_STAMP_TTL_SECONDS = 1.0
 # Widest directory mtime granularity in use (FAT rounds to 2 s, HFS+ to 1 s; a kernel without
 # fine-grained timestamps stamps every change within one ~4 ms clock tick alike).
@@ -593,9 +597,8 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
     ``kind: model-provider`` (PluginManager owns every other kind there). Per-home module names
     let two profiles carry the same plugin without aliasing each other's registrations.
     """
-    global _discovering
-    token, prior_discovering = _REGISTRATION_TARGET.set(layer), _discovering
-    _discovering = True
+    token = _REGISTRATION_TARGET.set(layer)
+    _scan_started()
     try:
         user_dir = _user_plugins_dir()
         if user_dir is not None:
@@ -611,7 +614,19 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
                     _import_plugin_dir(child, "user", home_key=key)
     finally:
         _REGISTRATION_TARGET.reset(token)
-        _discovering = prior_discovering
+        _scan_finished()
+
+
+def _scan_started() -> None:
+    global _discovering
+    with _DISCOVERING_LOCK:
+        _discovering = int(_discovering) + 1
+
+
+def _scan_finished() -> None:
+    global _discovering
+    with _DISCOVERING_LOCK:
+        _discovering = max(0, int(_discovering) - 1)
 
 
 def _plugin_disabled(plugin_dir: Path) -> bool:
@@ -927,15 +942,15 @@ def _discover_providers() -> None:
 
     if safe_worker_enabled():
         return
-    global _discovered, _discovering
+    global _discovered
     if _discovered:
         return
     _discovered = True
-    _discovering = True
+    _scan_started()
     try:
         _run_discovery_steps()
     finally:
-        _discovering = False
+        _scan_finished()
         # hermes_cli.auth may have been imported by a plugin during discovery and snapshotted a
         # partial profile list — hand it the complete one (no-op unless auth is already loaded).
         _sync_auth_registry()
