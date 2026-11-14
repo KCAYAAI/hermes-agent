@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,10 @@ _SNAPSHOT_IGNORE = shutil.ignore_patterns("__pycache__", ".git", "node_modules",
 # One directory per process for the frozen copies; removed when the process exits.
 _snapshot_root: Path | None = None
 _snapshot_lock = threading.Lock()
+# How often the copies are marked as in use: well inside the scratch dir's idle retention (24 h).
+_KEEP_IN_USE_SECONDS = 3600.0
+# The (root, thread) marking the copies as in use; None until one started.
+_keeper: tuple[Path, threading.Thread] | None = None
 
 
 @dataclass
@@ -62,6 +67,7 @@ def _snapshot(plugin_dir: Path, module_name: str) -> Path:
         if _snapshot_root is None:
             _snapshot_root = Path(tempfile.mkdtemp(prefix="hermes-provider-plugins-"))
             atexit.register(shutil.rmtree, _snapshot_root, True)
+        _keep_in_use(_snapshot_root)  # every copy: a keeper that could not start is tried again
     target = _snapshot_root / module_name / plugin_dir.name
     if target.is_dir():
         return target
@@ -76,6 +82,35 @@ def _snapshot(plugin_dir: Path, module_name: str) -> Path:
     finally:
         shutil.rmtree(private, ignore_errors=True)
     return target
+
+
+def _keep_in_use(root: Path) -> None:
+    """Write into *root* now and then for as long as this process runs. The copies live in Hermes' scratch
+    dir, which drops an entry nothing wrote to for a day, while a module file is read once, when it is first
+    imported: a plugin file first needed after that day (``create_client``'s import, in a profile that had
+    not used the provider yet) was gone, and the provider failed until the process restarted.
+
+    Called under ``_snapshot_lock``. A process with no thread to spare still loads the plugin: the copy is
+    only at risk a day later, and the next copy tries again."""
+    global _keeper
+    if _keeper is not None and _keeper[0] == root and _keeper[1].is_alive():
+        return
+
+    def beat() -> None:
+        while root.is_dir():  # removed at exit, or by hand: nothing left to keep
+            try:
+                (root / ".in-use").write_text(str(os.getpid()), encoding="utf-8")
+            except OSError:
+                pass  # a full disk now must not end the keep-alive for good
+            time.sleep(_KEEP_IN_USE_SECONDS)
+
+    keeper = threading.Thread(target=beat, name="provider-plugin-copies", daemon=True)
+    try:
+        keeper.start()
+    except RuntimeError as exc:  # "can't start new thread"
+        logger.warning("Provider plugin copies in %s are not marked as in use yet: %s", root, exc)
+        return
+    _keeper = (root, keeper)
 
 
 def tree_fingerprint(plugin_dir: Path) -> str:
