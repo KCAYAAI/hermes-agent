@@ -31,7 +31,9 @@ import sys
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from hermes_cli.home_data_layout import PROVIDER_PLUGIN_SNAPSHOT_PARTS
 from hermes_constants import get_default_hermes_root, mkdir_under_hermes_home
@@ -141,15 +143,40 @@ def _new_root() -> Path:
     return root
 
 
-def _snapshot(plugin_dir: Path, module_name: str) -> Path:
-    """A frozen copy of *plugin_dir* for *module_name* (per home, plugin and tree), named like the original
-    (load errors key on it). Copied into a private directory and published by one rename, so a concurrent scan
-    never imports a half-written copy; a failed copy leaves nothing behind."""
+@dataclass
+class _TreeImport:
+    """One import of one plugin tree (per home, plugin and fingerprint): what it registered, and when it is
+    done. Turn threads share a home's layer, so a second scan can meet a tree another thread is still
+    importing, or one an earlier scan imported before the layer moved to another tree."""
+    staging: Any  # the ``_HomeLayer`` the tree registered into
+    thread: int  # ident of the importing thread: its own re-entrant scan must not wait for itself
+    done: threading.Event = field(default_factory=threading.Event)
+    ok: bool = False
+
+
+_tree_imports: dict[str, _TreeImport] = {}
+_tree_imports_lock = threading.Lock()
+# How long a scan waits for another thread's import of the same tree. Bounded, never a lock: the importing
+# thread may itself be waiting on a module import lock this thread holds.
+_IMPORT_WAIT_SECONDS = 20.0
+
+
+def _process_root() -> Path:
+    """This process's snapshot root, made on first use. Its setup can wait up to ``_SETUP_WAIT_SECONDS`` on
+    another process's setup lock, so a scan makes it BEFORE it publishes a pending tree import: a scan that
+    meets the pending import then waits only on the plugin's own import, never on this setup."""
     global _snapshot_root
     with _snapshot_lock:
         if _snapshot_root is None:
             _snapshot_root = _new_root()
-    target = _snapshot_root / module_name / plugin_dir.name
+        return _snapshot_root
+
+
+def _snapshot(plugin_dir: Path, module_name: str) -> Path:
+    """A frozen copy of *plugin_dir* for *module_name* (per home, plugin and tree), named like the original
+    (load errors key on it). Copied into a private directory and published by one rename, so a concurrent scan
+    never imports a half-written copy; a failed copy leaves nothing behind."""
+    target = _process_root() / module_name / plugin_dir.name
     if target.is_dir():
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +211,11 @@ def tree_fingerprint(plugin_dir: Path) -> str:
 
 def import_into_layer(plugin_dir: Path, source: str, base_name: str) -> None:
     """Import *plugin_dir* into the layer being scanned unless that exact tree is already live there; an
-    updated tree replaces the live one only once it imported completely."""
+    updated tree replaces the live one only once it imported completely.
+
+    Each tree is imported once per process, by the first scan that meets it. A scan that meets a tree another
+    thread is importing waits for that import instead of publishing its own empty result over it: the module
+    being in ``sys.modules`` says the tree was claimed, not that this call registered anything."""
     import providers as P
 
     layer = P._REGISTRATION_TARGET.get()
@@ -193,30 +224,77 @@ def import_into_layer(plugin_dir: Path, source: str, base_name: str) -> None:
     if live is not None and live[0] == fingerprint:
         return
     module_name = f"{base_name}_{fingerprint}"
-    staging = P._HomeLayer()
-    token = P._REGISTRATION_TARGET.set(staging)
     try:
-        # In-process code (including a hosted plugin's in-process profiles) reads the frozen copy; the plugin
-        # host keeps the installed path, the stable key of its extraction cache.
-        P._import_user_module(plugin_dir, source, module_name, code_dir=_snapshot(plugin_dir, module_name))
-    except OSError as exc:  # the frozen copy could not be made: keep serving the previous version
+        _process_root()  # before the pending import is visible (see _process_root)
+    except OSError as exc:  # no snapshot root: keep serving the previous version, as a failed copy does
         logger.warning("Could not stage provider plugin %s: %s", plugin_dir.name, exc)
-        staging.errors[plugin_dir.name] = f"{type(exc).__name__}: {exc}"
-    finally:
-        P._REGISTRATION_TARGET.reset(token)
-    if module_name in sys.modules or module_name in staging.hosted:
-        _publish(layer, base_name, module_name, fingerprint, staging, replacing=live is not None)
-        layer.errors.pop(plugin_dir.name, None)
-        if live is not None:
-            logger.info("Provider plugin %s changed on disk; new sessions use the updated version",
-                        plugin_dir.name)
+        layer.errors[plugin_dir.name] = f"{type(exc).__name__}: {exc}"
         return
-    # A failed import leaves the previous version serving; drop what it half-loaded so a retry is clean.
-    prefix = module_name + "."
-    for name in [m for m in sys.modules if m.startswith(prefix)]:
-        del sys.modules[name]
-    if error := staging.errors.get(plugin_dir.name):
-        layer.errors[plugin_dir.name] = error
+    with _tree_imports_lock:
+        other = _tree_imports.get(module_name)
+        if other is not None and other.done.is_set() and not _still_loaded(module_name, other):
+            other = None  # its module was dropped since (a reset): import the tree again
+        if other is None:
+            mine = _tree_imports[module_name] = _TreeImport(P._HomeLayer(), threading.get_ident())
+    if other is not None:
+        _adopt(layer, plugin_dir, base_name, module_name, fingerprint, other)
+        return
+    staging = mine.staging
+    try:
+        token = P._REGISTRATION_TARGET.set(staging)
+        try:
+            # In-process code (including a hosted plugin's in-process profiles) reads the frozen copy; the
+            # plugin host keeps the installed path, the stable key of its extraction cache.
+            P._import_user_module(plugin_dir, source, module_name, code_dir=_snapshot(plugin_dir, module_name))
+        except OSError as exc:  # the frozen copy could not be made: keep serving the previous version
+            logger.warning("Could not stage provider plugin %s: %s", plugin_dir.name, exc)
+            staging.errors[plugin_dir.name] = f"{type(exc).__name__}: {exc}"
+        finally:
+            P._REGISTRATION_TARGET.reset(token)
+        if _still_loaded(module_name, mine):
+            _publish(layer, base_name, module_name, fingerprint, staging, replacing=live is not None)
+            layer.errors.pop(plugin_dir.name, None)
+            mine.ok = True
+            if live is not None:
+                logger.info("Provider plugin %s changed on disk; new sessions use the updated version",
+                            plugin_dir.name)
+            return
+        # A failed import leaves the previous version serving; drop what it half-loaded so a retry is clean.
+        prefix = module_name + "."
+        for name in [m for m in sys.modules if m.startswith(prefix)]:
+            del sys.modules[name]
+        if error := staging.errors.get(plugin_dir.name):
+            layer.errors[plugin_dir.name] = error
+    finally:
+        if not mine.ok:
+            with _tree_imports_lock:
+                if _tree_imports.get(module_name) is mine:
+                    del _tree_imports[module_name]  # the next scan retries the tree
+        mine.done.set()  # after the publish: a waiting scan finds the tree live
+
+
+def _still_loaded(module_name: str, tree: _TreeImport) -> bool:
+    return module_name in sys.modules or module_name in tree.staging.hosted
+
+
+def _adopt(layer, plugin_dir: Path, base_name: str, module_name: str, fingerprint: str,
+           tree: _TreeImport) -> None:
+    """Take a tree some other scan imported (or is importing) instead of importing it a second time."""
+    if not tree.done.is_set():
+        if tree.thread == threading.get_ident():
+            return  # this thread is importing it: the plugin's own imports looked a provider up
+        if not tree.done.wait(_IMPORT_WAIT_SECONDS):
+            logger.warning("Provider plugin %s is still importing in another thread after %.0fs; its "
+                           "providers appear once that import completes", plugin_dir.name, _IMPORT_WAIT_SECONDS)
+            return
+    if not tree.ok:
+        return  # the import failed there, and recorded its error on this layer
+    live = layer.trees.get(base_name)
+    if live is not None and live[0] == fingerprint:
+        return  # the importing scan published it
+    # The layer moved to another tree and came back to this one (a rollback restoring the same files).
+    _publish(layer, base_name, module_name, fingerprint, tree.staging, replacing=live is not None)
+    layer.errors.pop(plugin_dir.name, None)
 
 
 def _publish(layer, base_name: str, module_name: str, fingerprint: str, staging, *, replacing: bool) -> None:
