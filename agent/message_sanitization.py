@@ -229,9 +229,13 @@ def _rebalance_json_closers(raw: str) -> str | None:
     return "".join(out) + "".join(_JSON_CLOSERS[ch] for ch in reversed(stack))
 
 
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?", *, log_arguments: bool = True) -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
-    control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
+    control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING.
+
+    ``log_arguments=False`` (the streaming assembler) logs the tool name and the length, never the
+    argument text: a provider that streams a call as the model writes it hands over a cut-off or
+    refused ``write_file`` with the file's content in it."""
     raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
 
     if not raw_stripped:
@@ -268,22 +272,32 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         fixed = fixed[:-1]
 
     if _loads_ok(fixed):
-        logger.warning("Repaired malformed tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], fixed[:80])
+        if log_arguments:
+            logger.warning("Repaired malformed tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], fixed[:80])
+        else:
+            logger.warning("Repaired malformed tool_call arguments for %s (%d characters)", tool_name, len(raw_stripped))
         return fixed
 
     # Pass 5: escape control chars inside strings (strict=False alone fails when other
     # malformations are present too), then retry.
     escaped = _escape_invalid_chars_in_json_strings(fixed)
     if escaped != fixed and _loads_ok(escaped):
-        logger.warning(
-            "Repaired control-char-laced tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], escaped[:80],
-        )
+        if log_arguments:
+            logger.warning(
+                "Repaired control-char-laced tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], escaped[:80],
+            )
+        else:
+            logger.warning("Repaired control-char-laced tool_call arguments for %s (%d characters)", tool_name, len(raw_stripped))
         return escaped
 
-    logger.warning(
-        "Unrepairable tool_call arguments for %s — replaced with empty object (was: %s)",
-        tool_name, raw_stripped[:_FULL_ARGS_LOG_BOUND],
-    )
+    if log_arguments:
+        logger.warning(
+            "Unrepairable tool_call arguments for %s — replaced with empty object (was: %s)",
+            tool_name, raw_stripped[:_FULL_ARGS_LOG_BOUND],
+        )
+    else:
+        logger.warning("Unrepairable tool_call arguments for %s — replaced with empty object (%d characters)",
+                       tool_name, len(raw_stripped))
     return "{}"
 
 
