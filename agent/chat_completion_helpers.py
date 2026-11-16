@@ -3197,11 +3197,15 @@ class _StreamingCall(StreamingWaitMonitor):
                 except json.JSONDecodeError:
                     # A dropped stream is never repaired: closing its prefix yields valid
                     # JSON that silently lacks every key and digit not yet streamed.
-                    if finish_reason is None:
+                    # Nor is a call cut at the output cap ("length"): the turn loop never runs it
+                    # (it re-sends the request), and a repair would only log its arguments.
+                    if finish_reason is None or finish_reason == "length":
                         has_truncated_tool_args = True
                     else:
-                        # Repair before flagging (GLM via Ollama); "{}" = unrepairable.
-                        repaired = _repair_tool_call_arguments(arguments, tc["function"]["name"] or "?")
+                        # Repair before flagging (GLM via Ollama); "{}" = unrepairable. The text
+                        # stays out of the log: these are arguments as streamed, possibly cut off.
+                        repaired = _repair_tool_call_arguments(arguments, tc["function"]["name"] or "?",
+                                                               log_arguments=False)
                         if repaired != "{}":
                             arguments = repaired
                         else:
