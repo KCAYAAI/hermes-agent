@@ -832,7 +832,7 @@ class GatewayConfig:
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: YAML .inf / -.inf
             session_store_max_age_days = 90
 
         from gateway.profile_routing import parse_profile_routes
@@ -917,6 +917,10 @@ def _load_gateway_config_layers(_home: Path, gw_data: dict, strict: bool) -> Gat
 
     def legacy_only() -> dict:
         abort_yaml_env_refresh()
+        # KC: a valid config.yaml session_store_max_age_days the bridge already read stays in force
+        # when a later block fails; the default would prune routes the owner chose to keep.
+        if isinstance(layered, dict) and "session_store_max_age_days" in layered:  # gateway.json may be a scalar
+            return {**gw_data, "session_store_max_age_days": layered["session_store_max_age_days"]}
         return gw_data
 
     config = GatewayConfig.from_dict(config_loader.with_yaml_fallback(_home, overlay, legacy_only, strict=strict))
