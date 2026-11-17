@@ -499,12 +499,29 @@ def _mutate_and_emit(skill_name: str, action: str, mutator: Callable[[dict[str, 
 
 
 # --- Counter bumps — telemetry for ALL skills regardless of provenance (observability only) ---
+def _read_tracking_enabled() -> bool:
+    """``skills.usage_tracking``: off skips view/use telemetry, the per-load write of
+    ``.usage.json`` (it changes the skills root, so every catalog cache rebuilds). Patch, lifecycle
+    and provenance records are written regardless."""
+    try:
+        from agent.skill_utils import skills_usage_tracking_enabled
+        return skills_usage_tracking_enabled()
+    except Exception:  # noqa: BLE001 - telemetry never fails a skill load; default stays on
+        logger.debug("skills.usage_tracking unreadable; recording usage", exc_info=True)
+        return True
+
+
 def bump_view(skill_name: str) -> None:
+    if not _read_tracking_enabled():
+        return
     _mutate(skill_name, lambda rec: _bump(rec, "view_count", "last_viewed_at"))
 
 
 def bump_use(skill_name: str, *, task_id: Optional[str] = None, session_id: Optional[str] = None) -> None:
     """Skill actively used (loaded into the prompt path / referenced from an assistant turn)."""
+    if not _read_tracking_enabled():
+        return
+
     def _apply(rec: dict[str, Any]) -> dict[str, Any]:
         uses = _non_negative_int(rec.get("use_count"))
         gen = _non_negative_int(rec.get("patch_generation"))

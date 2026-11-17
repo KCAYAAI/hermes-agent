@@ -4,6 +4,7 @@ Import-light by design: no tool registry, CLI config, or provider resolution."""
 import ast
 import hashlib
 import logging
+import math
 import os
 import re
 import sys
@@ -260,6 +261,25 @@ def _skills_cfg_get(key: str) -> Any:
     """``skills.<key>`` from config.yaml, or None when the section is absent/malformed."""
     skills_cfg = _skills_cfg()
     return skills_cfg.get(key) if skills_cfg is not None else None
+
+
+def skills_verify_interval() -> float:
+    """``skills.verify_interval_seconds``: how long skill_view trusts a lookup index it verified
+    before re-checking the tree. 0 (default, and any invalid value) = check on every lookup."""
+    raw = _skills_cfg_get("verify_interval_seconds")
+    if isinstance(raw, bool):
+        return 0.0
+    try:
+        value = float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def skills_usage_tracking_enabled() -> bool:
+    """``skills.usage_tracking`` (default on): record skill views/uses in skills/.usage.json."""
+    from utils.env import is_truthy_value
+    return is_truthy_value(_skills_cfg_get("usage_tracking"), default=True)
 
 
 def _expand_path(entry: str) -> Path:

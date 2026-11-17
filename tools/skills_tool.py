@@ -168,6 +168,7 @@ skill_matches_environment = _skill_utils_delegate("skill_matches_environment")
 skill_matches_apps = _skill_utils_delegate("skill_matches_apps")
 _parse_frontmatter = _skill_utils_delegate("parse_frontmatter")
 _get_disabled_skill_names = _skill_utils_delegate("get_disabled_skill_names")
+_verify_interval = _skill_utils_delegate("skills_verify_interval")
 
 
 def check_skills_requirements() -> bool:
@@ -449,10 +450,25 @@ class _LookupIndex(NamedTuple):
     plain: bool  # every directory of the tree could be listed and matches names by exact case
 
 
+# skills.verify_interval_seconds: {realpath: (index, verified_at, check_started)} for the last check
+# that found that exact index current (or built it). Valid only while the entry is
+# still the published index object (identity) and the generation has not moved: a clear always
+# wins over a verification that started before it. Verification never extends ``built_at``.
+_LOOKUP_VERIFIED: dict = {}
+_LOOKUP_GENERATION = [0]
+_VERIFY_LOCKS: dict = {}  # one verifier per real directory; the others keep the verified index
+# Sentinel keys a lookup leaves in its ``checked`` map: _SERVED_UNVERIFIED = some root was
+# served from a trusted (not re-checked) index; _FORCE_VERIFY = re-check every root regardless.
+_SERVED_UNVERIFIED = object()
+_FORCE_VERIFY = object()
+
+
 def clear_skill_lookup_index() -> None:
     """Drop every lookup index so the next skill_view rebuilds (after a skill_manage write)."""
     with _SKILL_LOOKUP_LOCK:
         _SKILL_LOOKUP_INDEX.clear()
+        _LOOKUP_VERIFIED.clear()
+        _LOOKUP_GENERATION[0] += 1
 
 
 def _skill_md_stats(root: str, relative_paths) -> list:
@@ -618,10 +634,121 @@ def _index_is_current(key: str, index: _LookupIndex) -> bool:
 
 def _lookup_index(search_dir: Path, checked: Optional[dict] = None) -> Optional[_LookupIndex]:
     """The current index of *search_dir*'s real directory. *checked* holds the indexes one lookup
-    has already validated, so two search dirs that are the same directory are checked once."""
+    has already validated, so two search dirs that are the same directory are checked once.
+
+    With ``skills.verify_interval_seconds`` > 0 an index this process verified within the interval
+    is used without re-checking the tree (each check stats every skill dir and SKILL.md; in a busy
+    gateway every stat waits on the GIL). One thread per directory re-checks when the window ends,
+    in the background once an index is verified; meanwhile the others keep the last verified
+    index, at most _MAX_STALE_SECONDS old."""
     key = os.path.realpath(search_dir)
     if checked is not None and key in checked:
         return checked[key]
+    interval = _verify_interval()
+    if interval <= 0:
+        return _checked_lookup_index(key, checked, publish=False)
+    forced = checked is not None and _FORCE_VERIFY in checked
+    if not forced and (index := _trusted_index(key, interval, checked)) is not None:
+        return index
+    verify_lock = _verify_lock(key)  # never an RLock: the background thread releases it
+    if forced or not verify_lock.acquire(blocking=False):
+        if not forced and (index := _trusted_index(key, _MAX_STALE_SECONDS, checked, ttl=False)) is not None:
+            # Another thread is re-checking: keep the last verified index (at most
+            # _MAX_STALE_SECONDS old) rather than queueing behind a walk that can take seconds.
+            return index
+        verify_lock.acquire()
+    handed_off = False
+    try:
+        if forced:
+            # A miss re-check: reuse a check that STARTED after this lookup's first pass did.
+            if (index := _trusted_index(key, None, checked, ttl=False,
+                                        started_after=checked[_FORCE_VERIFY])) is not None:
+                return index
+            return _checked_lookup_index(key, checked, publish=True)
+        if (index := _trusted_index(key, interval, checked)) is not None:  # verified while we waited
+            return index
+        if _BACKGROUND_VERIFY and (index := _trusted_index(
+                key, _MAX_STALE_SECONDS, checked, ttl=False)) is not None:
+            # Window over but a recent verified index exists: re-check off the request path and
+            # serve it now. The thread owns (and releases) the verify lock from here on.
+            handed_off = True
+            try:
+                threading.Thread(target=_background_verify, args=(key, verify_lock),
+                                 name="skills-lookup-verify", daemon=True).start()
+            except RuntimeError:  # no thread available (interpreter shutdown): check inline
+                handed_off = False
+                if checked is not None:
+                    checked.pop(key, None)
+                    checked.pop(_SERVED_UNVERIFIED, None)
+            else:
+                return index
+        return _checked_lookup_index(key, checked, publish=True)
+    finally:
+        if not handed_off:
+            verify_lock.release()
+
+
+# Off only in tests that assert the synchronous check order.
+_BACKGROUND_VERIFY = True
+# Hard cap on how old (since its last verification) an index may be when served without a check.
+# Past it the caller checks inline: an idle process pays one walk, never an hours-old answer.
+# Staleness bound for another process's rename/duplicate: interval + one check, never past this.
+_MAX_STALE_SECONDS = 60.0
+
+
+def _background_verify(key: str, verify_lock: threading.Lock) -> None:
+    try:
+        _checked_lookup_index(key, None, publish=True)
+    except Exception as exc:  # noqa: BLE001 - drop trust so the next caller checks inline and sees it
+        with _SKILL_LOOKUP_LOCK:
+            _LOOKUP_VERIFIED.pop(key, None)
+        logger.warning("skills lookup background re-check of %s failed: %s", key, exc)
+    finally:
+        verify_lock.release()
+
+
+def _verify_lock(key: str) -> threading.Lock:
+    # One small lock per distinct skills root for the life of the process (roots are few).
+    lock = _VERIFY_LOCKS.get(key)
+    if lock is None:
+        with _SKILL_LOOKUP_LOCK:
+            lock = _VERIFY_LOCKS.setdefault(key, threading.Lock())
+    return lock
+
+
+# A miss or ambiguity is re-checked only when the check behind the serving index started at least
+# this long ago: a model retrying a bad name must not keep a full tree walk hot.
+_RECHECK_MIN_AGE_SECONDS = 1.0
+
+
+def _trusted_index(key: str, max_age: Optional[float], checked: Optional[dict], *, ttl: bool = True,
+                   started_after: Optional[float] = None) -> Optional[_LookupIndex]:
+    """The published index of *key* if this process verified that exact object less than
+    *max_age* seconds ago (None = any age), when *ttl* inside the TTL, and when *started_after*
+    by a check that started at or after it; else None."""
+    index = _SKILL_LOOKUP_INDEX.get(key)
+    record = _LOOKUP_VERIFIED.get(key)
+    if index is None or record is None or record[0] is not index:
+        return None
+    _index, verified_at, check_started = record
+    now = time.monotonic()
+    if ((ttl and now - index.built_at >= _SKILLS_CACHE_TTL_SECONDS)
+            or (max_age is not None and now - verified_at >= max_age)
+            or (started_after is not None and check_started < started_after)):
+        return None
+    if checked is not None:
+        checked[key] = index
+        if started_after is None and now - check_started >= _RECHECK_MIN_AGE_SECONDS:
+            checked[_SERVED_UNVERIFIED] = True
+    return index
+
+
+def _checked_lookup_index(key: str, checked: Optional[dict], *, publish: bool) -> Optional[_LookupIndex]:
+    """Check the published index against the tree and rebuild it when stale (the per-call path).
+    *publish* records a successful check for the verify interval, unless a clear happened since.
+    The window starts when the check COMPLETES (a check can take seconds under load; stamped at
+    its start the window would be over before it opened); the start is kept for the miss re-check."""
+    generation, check_started = _LOOKUP_GENERATION[0], time.monotonic()
     index = _SKILL_LOOKUP_INDEX.get(key)
     if index is None or not _index_is_current(key, index):
         with _SKILL_LOOKUP_LOCK:  # one build per change, not one per concurrent gateway thread
@@ -636,14 +763,20 @@ def _lookup_index(search_dir: Path, checked: Optional[dict] = None) -> Optional[
                         raise
                     # A shorter caller spelling can still work. Do not publish a partial index.
                     _SKILL_LOOKUP_INDEX.pop(key, None)
+                    _LOOKUP_VERIFIED.pop(key, None)
                     if checked is not None:
                         checked[key] = None
                     return None
                 _SKILL_LOOKUP_INDEX.pop(key, None)
                 while len(_SKILL_LOOKUP_INDEX) >= _LOOKUP_INDEX_MAX_DIRS:
-                    del _SKILL_LOOKUP_INDEX[next(iter(_SKILL_LOOKUP_INDEX))]
+                    _LOOKUP_VERIFIED.pop(evicted := next(iter(_SKILL_LOOKUP_INDEX)), None)
+                    del _SKILL_LOOKUP_INDEX[evicted]
                 _SKILL_LOOKUP_INDEX[key] = current
             index = current
+    if publish:
+        with _SKILL_LOOKUP_LOCK:  # a clear since this check started wins: nothing is published
+            if _LOOKUP_GENERATION[0] == generation and _SKILL_LOOKUP_INDEX.get(key) is index:
+                _LOOKUP_VERIFIED[key] = (index, time.monotonic(), check_started)
     if checked is not None:
         checked[key] = index
     return index
@@ -709,15 +842,18 @@ def _indexed_skill_matches(search_dir: Path, name: str, checked: Optional[dict] 
             and _still_walked(smd, search_dir)], flat
 
 
-def _collect_skill_candidates(name, local_category_name, all_dirs):
+def _collect_skill_candidates(name, local_category_name, all_dirs, checked: Optional[dict] = None):
     """ALL (skill_dir, skill_md) candidates across every dir and lookup strategy (direct path,
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
     Every copy is returned so the caller resolves them via ``agent.skill_utils.pick_skill_candidate``
-    (cross-tier precedence; a same-tier tie of different skills is refused, never guessed)."""
+    (cross-tier precedence; a same-tier tie of different skills is refused, never guessed).
+    *checked* (lookup indexes already validated for this call, by real directory) is the caller's
+    when it needs to know whether a trusted index served the call."""
     from agent.skill_utils import iter_skill_index_files
     candidates: list[tuple[Optional[Path], Path]] = []
     seen_md: set = set()
-    checked: dict = {}  # lookup indexes already validated for this call, by real directory
+    if checked is None:
+        checked = {}
 
     def _record(sd: Optional[Path], smd: Path) -> None:
         key = smd
@@ -849,17 +985,33 @@ def _owning_search_dir(skill_md: Path, all_dirs) -> Optional[Path]:
     return max(owners, key=lambda d: len(d.parts), default=None)
 
 
+# A miss or ambiguity seen through a trusted index: look again, verified. Compared by identity;
+# a str so the (error_json, dir, md) tuple keeps one type.
+_RECHECK = "\x00skills-recheck"
+
+
 def locate_skill(name: str, local_category_name: Optional[str], roots):
     """Unique on-disk skill for *name* over ``(tier, dir)`` *roots*: cross-tier precedence
     (project > local > create_dir > external, shadowed copies logged), same-tier collision refusal,
     same-root identical-copy ranking, quarantine gate, not-found listing. ``(error_json, skill_dir,
-    skill_md)``; skill_md set iff no error."""
+    skill_md)``; skill_md set iff no error. A not-found or ambiguous answer that came through an
+    index trusted under ``skills.verify_interval_seconds`` is re-resolved once with every root
+    re-checked, so a skill another process just added or removed is not misreported."""
+    first_pass = time.monotonic()
+    result = _locate_skill_pass(name, local_category_name, roots, {})
+    if result[0] is _RECHECK:
+        result = _locate_skill_pass(name, local_category_name, roots, {_FORCE_VERIFY: first_pass})
+    return result
+
+
+def _locate_skill_pass(name: str, local_category_name: Optional[str], roots, checked: dict):
     from agent.skill_utils import AMBIGUOUS_SKILL_PREFIX, TIER_PROJECT, pick_skill_candidate, skill_candidate_rank
     all_dirs = [d for _t, d in roots]
     if not all_dirs:
         return _fail(
             "Skills directory does not exist yet. It will be created on first install."), None, None
-    candidates = _collect_skill_candidates(name, local_category_name, all_dirs)
+    candidates = _collect_skill_candidates(name, local_category_name, all_dirs, checked)
+    recheck = bool(checked.get(_SERVED_UNVERIFIED)) and _FORCE_VERIFY not in checked
     tier_of = {d: t for t, d in roots}
     if len(candidates) > 1:
         owned = [(c, _owning_search_dir(c[1], all_dirs)) for c in candidates]
@@ -874,6 +1026,8 @@ def locate_skill(name: str, local_category_name: Optional[str], roots):
         else:
             candidates = [candidates[i] for i in contenders]
     if len(candidates) > 1:
+        if recheck:
+            return _RECHECK, None, None
         paths = [str(smd) for _, smd in candidates]
         # A root-level copy's path IS the bare name, so it can't disambiguate itself.
         load_names = sorted({_owned_relative(sd, smd, all_dirs) for sd, smd in candidates} - {name})
@@ -898,6 +1052,8 @@ def locate_skill(name: str, local_category_name: Optional[str], roots):
                 hint="Inspect the skill in the repo checkout, or untrust the repo with "
                 "`hermes skills untrust`."), None, None
     if not skill_md or not skill_md.exists():
+        if recheck:
+            return _RECHECK, None, None
         available = [s["name"] for s in sort_skills(find_all_skills())[:20]]
         return _fail(f"Skill '{name}' not found.", available_skills=available,
                      hint="Use skills_list to see all available skills"), None, None

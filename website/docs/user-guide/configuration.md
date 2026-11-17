@@ -932,6 +932,19 @@ skills:
 
 When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed with `/skills pending`, `/skills diff <id>`, `/skills approve <id>`, `/skills reject <id>` — from the CLI or any messaging platform. Toggle at runtime with `/skills approval on|off`. Memory has the same gate (`memory.write_approval`, below). Neither gate covers direct edits by the generic file tools or the terminal. Full walkthrough: [Gating agent skill writes](./features/skills.md#gating-agent-skill-writes-skillswrite_approval).
 
+### Skill lookup cost on a busy gateway
+
+Every `skill_view` normally re-checks the skills tree (one `stat` per skill directory and `SKILL.md`) to be sure its name-to-path index is current. With hundreds of skills in a gateway serving many sessions, those stats compete for the Python interpreter lock and a single load can take tens of seconds. Two settings remove that cost:
+
+```yaml
+skills:
+  verify_interval_seconds: 5   # default 0 = re-check on every lookup
+  usage_tracking: false        # default true
+```
+
+- `verify_interval_seconds` — trust an index this process verified within the last N seconds. When the window ends, one background thread re-checks while other lookups keep the last verified index; an index last verified more than 60 seconds ago is never served unchecked. A not-found or ambiguous result is re-checked against the tree before it is reported, unless a check started less than a second earlier. A skill renamed, moved or newly duplicated by another process can resolve to the previous answer for the interval plus the length of one check (seconds; longer on a heavily loaded process), and never more than 60 seconds. `skill_manage` writes in the same process clear the index immediately.
+- `usage_tracking` — record `skill_view` views and prompt uses in `skills/.usage.json` (the [curator's](./features/curator.md#usage-telemetry) telemetry). Each record rewrites that file, which makes every process rebuild its skills catalog. Turn it off when you don't run the curator. Patch counts and lifecycle state are still recorded.
+
 ## Memory Configuration
 
 ```yaml

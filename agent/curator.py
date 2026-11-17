@@ -103,7 +103,15 @@ def _config_number(key: str, default, cast):
 
 
 def is_enabled() -> bool:  # default ON when no config says otherwise
-    return bool(_load_config().get("enabled", True))
+    if not bool(_load_config().get("enabled", True)):
+        return False
+    # The stale/archive clocks read last_used_at/last_viewed_at; with skills.usage_tracking off
+    # nothing records use, so every skill would look unused. Refuse rather than archive by default.
+    from agent.skill_utils import skills_usage_tracking_enabled
+    if not skills_usage_tracking_enabled():
+        logger.debug("curator: disabled because skills.usage_tracking is false (no usage to judge staleness)")
+        return False
+    return True
 
 
 def get_interval_hours() -> int:

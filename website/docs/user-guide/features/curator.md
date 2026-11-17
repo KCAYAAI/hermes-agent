@@ -400,6 +400,10 @@ Counters increment when:
 
 Bundled and hub-installed skills are explicitly excluded from telemetry writes.
 
+`skills.usage_tracking: false` stops the `view_count` and `use_count` writes (patch counts and
+lifecycle state are still recorded). The curator then sees no recent use, so leave it on wherever
+the curator runs. See [Skill lookup cost on a busy gateway](../configuration.md#skill-lookup-cost-on-a-busy-gateway).
+
 ## Per-run reports
 
 Every curator run writes a timestamped directory under `~/.hermes/logs/curator/`:

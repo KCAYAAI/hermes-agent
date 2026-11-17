@@ -1417,6 +1417,14 @@ DEFAULT_CONFIG = {
         # host-unapproved skill-author code; community hub installs never auto-execute (#63307).
         "inline_shell": False,
         "inline_shell_timeout": 10,  # seconds per !`cmd` snippet
+        # skill_view trusts a lookup index this process verified within this many seconds instead
+        # of re-statting the whole tree per call (thousands of stats; each waits on the GIL in a
+        # busy gateway). A skill another process renames or duplicates may resolve to the old
+        # answer for this long plus one check (never past 60 s); a miss is re-checked. 0 = every call.
+        "verify_interval_seconds": 0,
+        # Record skill views/uses in skills/.usage.json (curator telemetry). Each record rewrites
+        # the file, which invalidates every process's skills catalog cache. Off when unused.
+        "usage_tracking": True,
         # Security-scan skills the agent writes via skill_manage. Off: the agent can run the same
         # code via terminal() ungated, so it mostly blocks prose with risky keywords. On: a
         # dangerous verdict is a tool error the agent can retry. Hub installs are always scanned.
