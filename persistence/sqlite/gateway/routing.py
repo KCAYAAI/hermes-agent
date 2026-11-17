@@ -28,9 +28,12 @@ from ..conversation.sessions import session_record
 from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
     _COMPRESSION_LINEAGE_CTE, _ORPHAN_CONTIGUITY_DONORS_SQL, _ORPHAN_LINEAGE_DONOR_SQL, _ORPHANS_SQL,
-    _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_RETIRED_SQL, apply_telegram_topic_migration, fence_shared_routes,
-    route_retired_params,
+    _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_FENCE_PREFIX, ROUTE_RETIRED_SQL, apply_telegram_topic_migration,
+    fence_shared_routes, route_retired_params, route_retired_sql,
 )
+from persistence.authority.vocabulary import RETRY_HORIZON_S
+from persistence.gateway.routing import route_namespace
+from ..conversation._store.retirement import RETIRED_PREFIX
 
 __all__ = ["SQLiteRoutingRepository"]
 
@@ -111,20 +114,58 @@ class SQLiteRoutingRepository:
             )
 
     def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
-        now = time.time()
-        rows = [{'scope': routing_scope, 'key': k, **route_retired_params(k, v, now)}
-                for k, v in entries.items() if k and v]
+        """Set-based (KC): the whole batch travels as ONE JSON parameter and each step is a single
+        statement, so the writer mutex is held for a handful of sqlite3 calls instead of one call per
+        row. Per-row ``executemany`` releases and re-takes the GIL on every row; in a busy multiplex
+        gateway each re-take waits behind other threads (a GIL convoy), which stretched a 0.2 s
+        rewrite of ~6k routes to 20-60 s and starved every other state.db writer into
+        ``WriterMutexTimeout``. Only rows whose entry changed are rewritten, so an unchanged row keeps
+        its ``updated_at`` and the WAL carries the delta, not the index."""
+        batch = [[k, v, route_namespace(k)] for k, v in entries.items() if k and v]
+        for key, value, _ns in batch:
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise TypeError(f"routing entries must map str -> JSON str, got {type(key).__name__} -> "
+                                f"{type(value).__name__}")
+        # ensure_ascii=False: a lone surrogate fails to encode at bind time and aborts the rewrite,
+        # as the per-row binds did, instead of travelling as a \ud800 escape and committing an
+        # undecodable row.
+        incoming_keys = frozenset(row[0] for row in batch)  # built once, outside the writer mutex
+        batch_json = json.dumps(batch, ensure_ascii=False)
+        batch_json.encode('utf-8')  # a lone surrogate raises UnicodeEncodeError here, before the mutex
+        params = {'scope': routing_scope, 'batch': batch_json, 'now': time.time(),
+                  'horizon': RETRY_HORIZON_S,
+                  'retired_prefix': RETIRED_PREFIX, 'fence_prefix': ROUTE_FENCE_PREFIX}
+        # The surviving (non-retired) routes, computed ONCE into a connection-private temp table:
+        # each entry's JSON is parsed for its session id one time, and the retired-route
+        # predicate runs once per route instead of once per statement that needs the set.
+        live = ("WITH b AS MATERIALIZED (SELECT json_extract(j.value, '$[0]') AS k, "
+                "json_extract(j.value, '$[1]') AS e, json_extract(j.value, '$[2]') AS ns FROM json_each(:batch) AS j), "
+                "i AS MATERIALIZED (SELECT k, e, ns, json_extract(e, '$.session_id') AS sid FROM b) "
+                f"SELECT k, e FROM i WHERE NOT {route_retired_sql('i.sid', 'i.ns')}")
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (routing_scope,))
-            if rows:
-                conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL,
-                    rows)
-            kept = {r[0] for r in conn.execute(
-                "SELECT session_key FROM gateway_routing WHERE scope = ?", (routing_scope,))}
-            return {row['key'] for row in rows} - kept
+            # Idempotent under _execute_write's whole-callback retry: the temp table is emptied
+            # first, and its DDL rolls back with the transaction.
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS kc_routing_batch "
+                         "(k TEXT PRIMARY KEY, e TEXT NOT NULL) WITHOUT ROWID")
+            conn.execute("DELETE FROM temp.kc_routing_batch")
+            conn.execute(f"INSERT INTO temp.kc_routing_batch (k, e) {live}", params)
+            # Drop rows absent from the batch and rows whose incoming entry is now retired.
+            conn.execute(
+                "DELETE FROM gateway_routing WHERE scope = :scope "
+                "AND session_key NOT IN (SELECT k FROM temp.kc_routing_batch)", params)
+            # Insert new rows; rewrite existing ones only when the entry actually changed.
+            conn.execute(
+                "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                "SELECT :scope, l.k, l.e, :now FROM temp.kc_routing_batch AS l WHERE true "
+                "ON CONFLICT(scope, session_key) DO UPDATE SET "
+                "entry_json = excluded.entry_json, updated_at = excluded.updated_at "
+                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", params)
+            conn.execute("DELETE FROM temp.kc_routing_batch")
+            kept_json = conn.execute(
+                "SELECT json_group_array(session_key) FROM gateway_routing WHERE scope = :scope",
+                params).fetchone()[0]
+            return set(incoming_keys - set(json.loads(kept_json or '[]')))
         with translated():
             holder = self._store.holder()
             return holder._execute_write(_do)
