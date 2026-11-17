@@ -1,5 +1,6 @@
 """Durable deletion fences outside prunable transcript rows."""
 import json
+import sqlite3
 import time
 from hermes_state_runtime import RuntimeStoreError, admission_fingerprint, mutation_receipt_key, _json, _text
 
@@ -283,38 +284,48 @@ def entry_session_id(raw):
     return value.get('session_id') if isinstance(value, dict) else None
 
 
-def _mark_retired(conn, key, *, expires, **fields):
-    # Replace: the marker is a fact, not a receipt; re-retiring an id that was recreated
-    # beside its tombstone must not abort the delete that removes it again (and restarts its horizon).
-    # An ``expires`` (sweep) marker ages out at the horizon and never shortens a permanent one.
-    # A permanent marker without ``own`` (an earlier release's, maybe another profile's shared
-    # fence) stays unscoped: it is the only fence of that profile's route. An earlier release's
-    # sweep marker came only from this store's own sweep, so it is replaced as written.
+def _mark_retired_many(conn, keys, *, expires, **fields):
+    """Write the retirement marker of every key in ONE statement (KC: set-based, one shared
+    ``retired_at``), so a bulk delete or prune does not step once per id under the writer mutex.
+
+    Replace: the marker is a fact, not a receipt; re-retiring an id that was recreated beside its
+    tombstone must not abort the delete that removes it again (and restarts its horizon). An
+    ``expires`` (sweep) marker ages out at the horizon and never shortens a permanent one. A
+    permanent marker without ``own`` (an earlier release's, maybe another profile's shared fence)
+    stays unscoped: it is the only fence of that profile's route. An earlier release's sweep marker
+    came only from this store's own sweep, so it is replaced as written."""
+    keys = sorted(set(keys))
+    if not keys:
+        return
     value = {'retired_at': time.time(), **fields}
+    batch = json.dumps(keys, ensure_ascii=False)
     if expires:
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+        conn.execute('INSERT INTO state_meta(key,value) SELECT j.value, ? FROM json_each(?) AS j WHERE true '
+                     'ON CONFLICT(key) DO UPDATE '
                      "SET value=excluded.value WHERE json_valid(state_meta.value) "
                      "AND json_extract(state_meta.value, '$.expires')",
-                     (key, json.dumps({**value, 'expires': True})))
+                     (json.dumps({**value, 'expires': True}), batch))
     else:
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=CASE '
+        conn.execute('INSERT INTO state_meta(key,value) SELECT j.value, ? FROM json_each(?) AS j WHERE true '
+                     'ON CONFLICT(key) DO UPDATE SET value=CASE '
                      "WHEN NOT json_valid(state_meta.value) THEN json_remove(excluded.value, '$.own') "
                      "WHEN json_extract(state_meta.value, '$.own') IS NOT NULL "
                      "OR json_extract(state_meta.value, '$.expires') THEN excluded.value "
-                     "ELSE json_remove(excluded.value, '$.own') END", (key, json.dumps(value)))
+                     "ELSE json_remove(excluded.value, '$.own') END", (json.dumps(value), batch))
 
 
 def retire_routes(conn, session_ids, *, expiring=()):
-    expiring = set(expiring)
-    for sid in session_ids:
-        _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid in expiring, own=True)
-        conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
-        conn.execute('DELETE FROM state_meta WHERE key=?', (VIEWER_CLOSE_PREFIX + sid,))
-    targets = set(session_ids)
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if entry_session_id(row['entry_json']) in targets:
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+    # Set-based (KC): a fixed handful of statements whatever the number of ids or routes.
+    ids, expiring = set(session_ids), set(expiring)
+    _mark_retired_many(conn, [RETIRED_PREFIX + sid for sid in ids if sid in expiring], expires=True, own=True)
+    _mark_retired_many(conn, [RETIRED_PREFIX + sid for sid in ids if sid not in expiring], expires=False, own=True)
+    gone = [prefix + sid for sid in ids for prefix in ('gateway.api.settings.v1.', VIEWER_CLOSE_PREFIX)]
+    conn.execute('DELETE FROM state_meta WHERE key IN (SELECT value FROM json_each(?))',
+                 (json.dumps(sorted(gone), ensure_ascii=False),))
+    # Set-based (KC): one statement, not one Python step per routing row under the writer mutex
+    # (the per-row scan convoys on the GIL in a busy multiplex gateway).
+    conn.execute(f'DELETE FROM gateway_routing WHERE {entry_session_id_sql("entry_json")} '
+                 'IN (SELECT value FROM json_each(?))', (json.dumps(sorted(set(session_ids))),))
 
 
 def route_namespace(session_key):
@@ -322,6 +333,38 @@ def route_namespace(session_key):
     the profile's ``_session_key_namespace`` slot); ``main`` for a key outside that shape."""
     parts = str(session_key or '').split(':')
     return parts[1] if len(parts) > 2 and parts[0] == 'agent' and parts[1] else 'main'
+
+
+def route_namespace_sql(key_expr):
+    """SQL twin of :func:`route_namespace` for the routing key in *key_expr*, as UTF-8 BYTES (a
+    BLOB): the second ``:``-separated segment of an ``agent:<ns>:...`` key, else ``b'main'``.
+    Byte-wise because SQLite's text functions stop at an embedded NUL where ``str.split`` does
+    not; ``:`` is one byte in UTF-8, so byte and character splitting agree. Compare the result
+    with ``CAST(<name> AS BLOB)``. Case-sensitive (no ``LIKE``); ``instr(...) > 1`` means a later
+    ``:`` exists and <ns> is non-empty."""
+    key = f"CAST({key_expr} AS BLOB)"
+    rest = f"substr({key}, 7)"
+    return (f"(CASE WHEN substr({key}, 1, 6) = CAST('agent:' AS BLOB) AND instr({rest}, x'3a') > 1 "
+            f"THEN substr({rest}, 1, instr({rest}, x'3a') - 1) ELSE CAST('main' AS BLOB) END)")
+
+
+def entry_session_id_sql(json_expr):
+    """SQL twin of :func:`entry_session_id`: the text ``session_id`` of a stored JSON object, else
+    NULL; never raises. Like ``json.loads`` it takes the LAST top-level ``session_id`` member
+    (``json_extract`` would take the first) and matches escaped keys. A non-text id (number,
+    array, object) is NULL: it names no target (the twin raised ``TypeError`` on unhashable ids
+    and aborted the whole delete; here such a malformed route is simply left alone). Each JSON
+    read sits in its own ``CASE WHEN`` because ``AND`` does not short-circuit on malformed text.
+    ``json_valid(x, 2)`` accepts JSON5 so NaN/Infinity (which ``json.dumps`` writes for float
+    nan/inf) parse as they do for ``json.loads``; other JSON5-only syntax (comments, unquoted
+    keys) is never written by ``json.dumps``."""
+    last_id = (f"(SELECT CASE WHEN j.type = 'text' THEN j.value END FROM json_each({json_expr}) AS j "
+               "WHERE j.key = 'session_id' ORDER BY j.id DESC LIMIT 1)")
+    # The flags argument of json_valid needs SQLite 3.45; an older library keeps strict JSON (NaN
+    # entries are then left alone, as before this change) instead of failing every retirement.
+    valid = f"json_valid({json_expr}, 2)" if sqlite3.sqlite_version_info >= (3, 45, 0) else f"json_valid({json_expr})"
+    return (f"(CASE WHEN {valid} THEN CASE WHEN json_type({json_expr}) = 'object' "
+            f"THEN {last_id} END END)")
 
 
 def route_fence_key(namespace, session_id):
@@ -340,19 +383,30 @@ def route_fence_key(namespace, session_id):
 # ``json_valid(...) AND``, so each JSON read sits in a ``CASE WHEN json_valid(...)`` branch.
 # Bound by name (``route_retired_params``): :entry is the route's JSON, :ns its key's
 # ``route_namespace``, :now the save's time.
-ROUTE_RETIRED_SQL = """(
+_ROUTE_RETIRED_TEMPLATE = """(
     EXISTS (SELECT 1 FROM state_meta m
-             WHERE m.key = :retired_prefix || json_extract(:entry, '$.session_id')
-               AND (:ns = 'main' OR NOT CASE WHEN json_valid(m.value)
+             WHERE m.key = :retired_prefix || @SID@
+               AND (@NS@ = 'main' OR NOT CASE WHEN json_valid(m.value)
                                              THEN json_extract(m.value, '$.own') IS NOT NULL ELSE 0 END))
     OR EXISTS (SELECT 1 FROM state_meta f
-                WHERE f.key = :fence_prefix || :ns || ':' || json_extract(:entry, '$.session_id')
+                WHERE f.key = :fence_prefix || @NS@ || ':' || @SID@
                   AND NOT CASE WHEN json_valid(f.value)
                                THEN coalesce(json_extract(f.value, '$.expires')
                                              AND json_extract(f.value, '$.retired_at') < :now - :horizon, 0)
                                ELSE 0 END
-                  AND (:ns != 'main' OR NOT EXISTS (
-                          SELECT 1 FROM sessions s WHERE s.id = json_extract(:entry, '$.session_id')))))"""
+                  AND (@NS@ != 'main' OR NOT EXISTS (
+                          SELECT 1 FROM sessions s WHERE s.id = @SID@))))"""
+
+
+def route_retired_sql(sid_expr, ns_expr):
+    """``ROUTE_RETIRED_SQL`` with the route's session id and namespace read from SQL expressions
+    (for example the columns of a materialized ``json_each`` batch) instead of the single-row
+    :entry / :ns parameters. Same predicate text, so the per-row and set-based saves cannot drift
+    apart. *sid_expr* must evaluate to ``json_extract(<entry json>, '$.session_id')``."""
+    return _ROUTE_RETIRED_TEMPLATE.replace('@SID@', sid_expr).replace('@NS@', ns_expr)
+
+
+ROUTE_RETIRED_SQL = route_retired_sql("json_extract(:entry, '$.session_id')", ':ns')
 
 
 def route_retired_params(session_key, entry_json, now):
@@ -385,18 +439,23 @@ def fence_shared_routes(conn, namespace, session_ids, *, expiring=()):
     launch-keyed route to it names the retired session. The sweep fences that aged out here are
     reclaimed in the same write, so the owner's prunes bound them without the launch profile's sweep."""
     _reclaim_expired(conn, ROUTE_FENCE_PREFIX, time.time() - RETRY_HORIZON_S)
-    expiring, owned = set(expiring), {}
-    for sid in session_ids:
-        names = {namespace}
-        if not conn.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone():
-            names.add('main')
-        for name in names:
-            _mark_retired(conn, route_fence_key(name, sid), expires=sid in expiring)
-        owned[sid] = names
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if route_namespace(row['session_key']) in owned.get(entry_session_id(row['entry_json']), ()):
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+    expiring, ids = set(expiring), set(session_ids)
+    # One read for which ids this store holds (no per-id query), then one marker statement per
+    # expiry class (set-based, KC).
+    held = set(json.loads(conn.execute(
+        'SELECT json_group_array(id) FROM sessions WHERE id IN (SELECT value FROM json_each(?))',
+        (json.dumps(list(ids), ensure_ascii=False),)).fetchone()[0] or '[]'))
+    owned = {sid: ({namespace} if sid in held else {namespace, 'main'}) for sid in ids}
+    for expires in (True, False):
+        _mark_retired_many(conn, [route_fence_key(name, sid) for sid, names in owned.items()
+                                  if (sid in expiring) is expires for name in names], expires=expires)
+    # Set-based (KC): drop every route whose (key namespace, session id) pair is fenced, in one
+    # statement instead of a per-row Python scan under the writer mutex.
+    pairs = [[name, sid] for sid, names in owned.items() for name in names]  # order-free: no sort
+    conn.execute(
+        f'DELETE FROM gateway_routing WHERE ({route_namespace_sql("session_key")}, '
+        f'{entry_session_id_sql("entry_json")}) IN (SELECT CAST(json_extract(p.value, \'$[0]\') AS BLOB), '
+        'json_extract(p.value, \'$[1]\') FROM json_each(?) AS p)', (json.dumps(pairs),))
 
 
 RETRY_HORIZON_S = 7 * 86400  # exact-retry horizon: a retry within it gets the byte-exact settled reply
