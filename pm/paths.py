@@ -64,8 +64,9 @@ def facts_path() -> Path:
 
 
 def writable_store_root() -> Path:
-    if not (store_root().parent / "manifest.json").is_file():
-        return store_root()
+    store = store_root()
+    if not (store.parent / "manifest.json").is_file():
+        return store
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "tools"
