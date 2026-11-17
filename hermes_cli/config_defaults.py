@@ -1417,6 +1417,13 @@ DEFAULT_CONFIG = {
         # host-unapproved skill-author code; community hub installs never auto-execute (#63307).
         "inline_shell": False,
         "inline_shell_timeout": 10,  # seconds per !`cmd` snippet
+        # skill_view trusts a lookup index this process verified within this many seconds instead
+        # of re-statting the whole tree per call (thousands of stats; each waits on the GIL in a
+        # busy gateway). When the window ends a background thread re-checks. A skill another process
+        # renames or duplicates may resolve to the old answer for this long plus one check (a change
+        # nested deeper than the quick check looks: until the 30 s TTL rebuild), never past 120 s; a
+        # not-found or ambiguous answer, and a refused one, is re-resolved checked first. 0 = every call.
+        "verify_interval_seconds": 0,
         # Security-scan skills the agent writes via skill_manage. Off: the agent can run the same
         # code via terminal() ungated, so it mostly blocks prose with risky keywords. On: a
         # dangerous verdict is a tool error the agent can retry. Hub installs are always scanned.

@@ -932,6 +932,17 @@ skills:
 
 When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed with `/skills pending`, `/skills diff <id>`, `/skills approve <id>`, `/skills reject <id>` — from the CLI or any messaging platform. Toggle at runtime with `/skills approval on|off`. Memory has the same gate (`memory.write_approval`, below). Neither gate covers direct edits by the generic file tools or the terminal. Full walkthrough: [Gating agent skill writes](./features/skills.md#gating-agent-skill-writes-skillswrite_approval).
 
+### Skill lookup cost on a busy gateway
+
+Every `skill_view` normally re-checks the skills tree (one `stat` per skill directory and `SKILL.md`) to be sure its name-to-path index is current. With hundreds of skills in a gateway serving many sessions, those stats compete for the Python interpreter lock and a single load can take tens of seconds. One setting removes that cost:
+
+```yaml
+skills:
+  verify_interval_seconds: 5   # default 0 = re-check on every lookup
+```
+
+An index this process verified within the last N seconds is used without re-checking. When the window ends, one background thread per skills directory re-checks the tree (and rebuilds the index once it is older than the 30-second skills cache TTL) while lookups keep the last verified index. No index is used without a check once its build, or the check behind it, started 120 seconds ago; past that the lookup checks first, and an index built that long ago is rebuilt rather than just re-checked. A not-found, ambiguous or quarantined result that came from a trusted index is always re-resolved on a fresh read of the whole tree before it is reported, and a skill that `skill_view` would refuse (unsupported platform, disabled, unreadable or not a regular file) is resolved once more the same way before the refusal stands, so a skill another process just added, renamed or moved is found. Otherwise a skill renamed, moved or newly duplicated by another process can resolve to the previous answer for the interval plus the length of a check; a change nested deeper than the quick check looks (six folders) shows after the next rebuild; never later than 120 seconds. `skill_manage` writes in the same process clear the index immediately.
+
 ## Memory Configuration
 
 ```yaml
