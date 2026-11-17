@@ -5,13 +5,17 @@ scripts/. `skills_list` returns name/description only; `skill_view` returns full
 linked files. Sibling modules (skills_tool_setup / _plugin / _dedup) re-export here."""
 
 import contextvars
+import errno
 import json
 import logging
 import os
+import stat
+import string
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
@@ -44,6 +48,7 @@ _SIGNATURE_MAX_DEPTH = 6
 def clear_skills_cache() -> None:
     """Drop the scanned catalog so the next listing re-scans (explicit reloads must not wait out the TTL)."""
     _SKILLS_CACHE.clear()
+    clear_skill_lookup_index()
 
 
 def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
@@ -417,6 +422,293 @@ def _is_package_owned_markdown(path: Path, search_root: Path) -> bool:
     )
 
 
+# Per-process skill lookup index, one per real directory: {realpath(search dir): _LookupIndex}. A
+# lookup used to parse every SKILL.md frontmatter and rglob the whole tree (backups, .git) per
+# skill_view call. Keyed by the real directory and holding relative paths, so the profiles whose
+# skills dir is a link to one shared tree share one index. Valid while the lookup signature and
+# every indexed SKILL.md's (mtime_ns, size) hold; the TTL bounds what neither sees (flat .md files
+# inside pruned dirs, skills below signature depth).
+_SKILL_LOOKUP_INDEX: dict = {}  # insertion order is build order: the first key is the oldest build
+_LOOKUP_INDEX_MAX_DIRS = 64
+_SKILL_LOOKUP_LOCK = threading.Lock()
+_GLOB_CHARS = frozenset("*?[]")
+_ASCII_SWAP = str.maketrans(string.ascii_lowercase + string.ascii_uppercase,
+                            string.ascii_uppercase + string.ascii_lowercase)
+
+
+class _LookupIndex(NamedTuple):
+    signature: list
+    stats: list
+    built_at: float
+    skill_mds: list  # relative SKILL.md paths in iter_skill_index_files order; the maps hold indices
+    root_skill: Optional[int]  # the search dir's own SKILL.md: its folder name is the caller's dir name
+    by_folder: dict
+    by_frontmatter: dict
+    by_filename: dict  # normcase(<file>.md) -> [(relative path, normcased relative parts)] in rglob order
+    linked_dirs: frozenset  # normcased names of symlinks to directories anywhere in the tree
+    plain: bool  # every directory of the tree could be listed and matches names by exact case
+
+
+def clear_skill_lookup_index() -> None:
+    """Drop every lookup index so the next skill_view rebuilds (after a skill_manage write)."""
+    with _SKILL_LOOKUP_LOCK:
+        _SKILL_LOOKUP_INDEX.clear()
+
+
+def _skill_md_stats(root: str, relative_paths) -> list:
+    out = []
+    for rel in relative_paths:
+        try:
+            s = os.stat(os.path.join(root, rel))
+            out.append((s.st_mtime_ns, s.st_size))
+        except OSError:
+            out.append(None)
+    return out
+
+
+def _folds_case(directory: str, names) -> bool:
+    """True when *directory* matches names without regard to case (a casefold directory, a
+    case-insensitive mount). The literal glob then finds Foo.md for foo; the index, keyed by the
+    exact name, would not. Probed with an ASCII-only case change of one entry name: every folding
+    filesystem folds ASCII, while a non-ASCII letter may have no partner it folds to. A directory
+    whose names have cased letters but no ASCII one cannot be probed and counts as folding.
+    Undecodable filenames are opaque on non-strict Linux casefold filesystems: their negative
+    probes say nothing about how valid filenames in that directory match."""
+    try:
+        for name in names:
+            name.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return True
+    unsure = False
+    for name in names:
+        other = name.translate(_ASCII_SWAP)
+        if other != name:
+            # Both spellings as entries means names differ by case here: not folding.
+            if other in names:
+                return False
+            try:
+                os.lstat(os.path.join(directory, other))
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                if exc.errno == errno.ENAMETOOLONG:
+                    raise  # the caller's shorter spelling may work
+                return True  # inconclusive: retain the original glob
+            return True
+        unsure = unsure or name.swapcase() != name
+    return unsure
+
+
+def _tree_links(root) -> tuple:
+    """``(names of the symlinks to directories, plain)`` for the real directories under *root*, the
+    ones rglob walks. *plain* is False when a directory could not be listed or folds case. The glob
+    finds a file through a symlinked directory named in its pattern, inside a directory it may enter
+    but not list, and under another case in a case-folding directory; the index walk sees none of
+    these, so lookups that could differ keep the real glob."""
+    linked, plain, stack = set(), True, [str(root)]
+    while stack:
+        directory = stack.pop()
+        names = set()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    names.add(entry.name)
+                    try:
+                        if entry.is_symlink():
+                            if entry.is_dir():
+                                linked.add(os.path.normcase(entry.name))
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                    except OSError as exc:
+                        if exc.errno == errno.ENAMETOOLONG:
+                            raise
+                        plain = False
+        except OSError as exc:
+            if exc.errno == errno.ENAMETOOLONG:
+                raise  # canonical spelling can be longer than the caller's usable alias
+            plain = False
+        if plain and _folds_case(directory, names):
+            plain = False
+    return frozenset(linked), plain
+
+
+def _lookup_signature(key: str) -> list:
+    """The catalog signature with the search root's own mtime replaced by the root's markdown
+    files and symlinks, by name. Every skill load rewrites <root>/.usage.json, which moves that
+    mtime, and an index dropped on every load would cost more than the walk it replaces. A lookup
+    depends on the root's directories (already in the signature), its ``.md`` files, and which of
+    its entries are links (the glob does not walk into a linked directory), nothing else there."""
+    signature: list = []
+    _dir_tree_signature(key, signature)
+    if signature:
+        try:
+            with os.scandir(key) as entries:
+                names = tuple(sorted((e.name, e.is_symlink()) for e in entries
+                                     if e.name.endswith(".md") or e.is_symlink()))
+        except OSError:
+            names = None
+        signature[0] = (signature[0][0], names, signature[0][2])
+    return signature
+
+
+def _frontmatter_name(skill_md) -> Optional[str]:
+    """The frontmatter ``name`` of a regular SKILL.md, else None. Opened without blocking and
+    checked on the open file: a FIFO or a device in its place must not hang the build, which runs
+    under the lookup lock. Any failure to read means no name, as in ``_safe_frontmatter``."""
+    content, fd = None, None
+    try:
+        fd = os.open(skill_md, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.set_blocking(fd, True)
+            # The outer finally owns fd, even if text-wrapper construction fails.
+            with open(fd, encoding="utf-8-sig", errors="replace", closefd=False) as handle:
+                content = handle.read()
+    except Exception as exc:
+        content = None  # a read or wrapper-close failure invalidates the entire read
+        if isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG:
+            raise  # the index must fall back rather than cache an omitted alias
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)  # once only: an error can still mean this fd was released
+            except OSError:
+                content = None
+    if content is None:
+        return None
+    frontmatter = _safe_frontmatter(content=content)
+    name = frontmatter.get("name") if isinstance(frontmatter, dict) else None
+    return name if isinstance(name, str) else None
+
+
+def _build_lookup_index(key: str) -> _LookupIndex:
+    """Signature and stats first, then read: a write racing the build shows as a change next call.
+    The TTL runs from the end of the build, so a slow build is not stale the moment it is done."""
+    from agent.skill_utils import iter_skill_index_files
+    root = Path(key)
+    signature = _lookup_signature(key)
+    skill_mds = [os.path.relpath(smd, key) for smd in iter_skill_index_files(root, "SKILL.md")]
+    stats = _skill_md_stats(key, skill_mds)
+    root_skill = None
+    by_folder: dict = {}
+    by_frontmatter: dict = {}
+    for i, rel in enumerate(skill_mds):
+        folder = os.path.dirname(rel)
+        if folder:
+            by_folder.setdefault(os.path.basename(folder), []).append(i)
+        else:
+            root_skill = i
+        if (fm_name := _frontmatter_name(os.path.join(key, rel))) is not None:
+            by_frontmatter.setdefault(fm_name, []).append(i)
+    # Same unpruned walk as today's rglob("<name>.md"), once per build; filters run per lookup.
+    by_filename: dict = {}
+    for md in root.rglob("*.md"):
+        parts = md.relative_to(root).parts
+        normed = tuple(os.path.normcase(part) for part in parts)
+        by_filename.setdefault(normed[-1], []).append((os.path.join(*parts), normed))
+    linked_dirs, plain = _tree_links(key)
+    return _LookupIndex(signature, stats, time.monotonic(), skill_mds, root_skill, by_folder, by_frontmatter,
+                        by_filename, linked_dirs, plain)
+
+
+def _index_is_current(key: str, index: _LookupIndex) -> bool:
+    if time.monotonic() - index.built_at >= _SKILLS_CACHE_TTL_SECONDS:
+        return False
+    return _lookup_signature(key) == index.signature and _skill_md_stats(key, index.skill_mds) == index.stats
+
+
+def _lookup_index(search_dir: Path, checked: Optional[dict] = None) -> Optional[_LookupIndex]:
+    """The current index of *search_dir*'s real directory. *checked* holds the indexes one lookup
+    has already validated, so two search dirs that are the same directory are checked once."""
+    key = os.path.realpath(search_dir)
+    if checked is not None and key in checked:
+        return checked[key]
+    index = _SKILL_LOOKUP_INDEX.get(key)
+    if index is None or not _index_is_current(key, index):
+        with _SKILL_LOOKUP_LOCK:  # one build per change, not one per concurrent gateway thread
+            current = _SKILL_LOOKUP_INDEX.get(key)
+            # While this thread waited, a clear may have dropped the entry or another thread may
+            # have rebuilt it: a rebuilt one is used only if it still holds.
+            if current is None or current is index or not _index_is_current(key, current):
+                try:
+                    current = _build_lookup_index(key)
+                except OSError as exc:
+                    if exc.errno != errno.ENAMETOOLONG:
+                        raise
+                    # A shorter caller spelling can still work. Do not publish a partial index.
+                    _SKILL_LOOKUP_INDEX.pop(key, None)
+                    if checked is not None:
+                        checked[key] = None
+                    return None
+                _SKILL_LOOKUP_INDEX.pop(key, None)
+                while len(_SKILL_LOOKUP_INDEX) >= _LOOKUP_INDEX_MAX_DIRS:
+                    del _SKILL_LOOKUP_INDEX[next(iter(_SKILL_LOOKUP_INDEX))]
+                _SKILL_LOOKUP_INDEX[key] = current
+            index = current
+    if checked is not None:
+        checked[key] = index
+    return index
+
+
+def _still_walked(skill_md: Path, search_dir: Path) -> bool:
+    """False when *skill_md* now sits in a support dir (references, templates, ...) of a directory
+    that holds a SKILL.md: the catalog walk skips those. A directory below the signature depth can
+    gain a SKILL.md without the index noticing, so this rule is read from disk for every cached hit."""
+    from agent.skill_utils import SKILL_SUPPORT_DIRS
+    try:
+        parts = skill_md.parent.relative_to(search_dir).parts
+    except ValueError:
+        return True
+    at = search_dir
+    for part in parts:
+        if part in SKILL_SUPPORT_DIRS:
+            owner = at / "SKILL.md"
+            if os.path.lexists(owner) and not os.path.isdir(owner):
+                return False
+        at = at / part
+    return True
+
+
+def _indexed_skill_matches(search_dir: Path, name: str, checked: Optional[dict] = None):
+    """``(skill_mds, flat_mds)`` exactly as the tree walk and ``rglob(f"{name}.md")`` find them, or
+    None when *name* holds glob characters or odd segments (those keep today's walk)."""
+    parts = name.split("/")
+    if _GLOB_CHARS.intersection(name) or "\\" in name or any(p in ("", ".", "..") for p in parts):
+        return None
+    index = _lookup_index(search_dir, checked)
+    if index is None or not index.signature or index.signature[0][1] is None:
+        # The caller may reach an open-directory alias whose canonical parents are inaccessible.
+        # An unreadable canonical root is not evidence that its caller-spelled tree is empty.
+        return None
+    if index.linked_dirs and len(os.fsencode(os.path.realpath(search_dir))) > len(os.fsencode(search_dir)):
+        # The catalog follows directory links but the flat-file walk does not. A canonical
+        # walk can silently skip a too-long path inside one: only the shorter caller walk
+        # can decide which frontmatter aliases exist in that subtree.
+        return None
+    hits = {*index.by_folder.get(name, ()), *index.by_frontmatter.get(name, ())}
+    if index.root_skill is not None and search_dir.name == name:
+        hits.add(index.root_skill)
+    hits = sorted(hits)
+    if any(os.path.islink(search_dir / index.skill_mds[i])
+           and (search_dir / index.skill_mds[i]).parent.name != name for i in hits):
+        # A canonical-root read can follow a final-file link that exceeds the caller path's
+        # symlink budget. Let the original walk decide frontmatter-only hits on such files.
+        return None
+    want = tuple(os.path.normcase(p) for p in parts[:-1]) + (os.path.normcase(parts[-1] + ".md"),)
+    # lexists per hit, as the literal glob does: a file deleted where the signature cannot see it, or
+    # one in a directory that can be listed but not entered, is not a candidate.
+    flat = [md for rel, normed in index.by_filename.get(want[-1], ())
+            if normed[-len(want):] == want and os.path.lexists(md := search_dir / rel)]
+    if not index.plain or (len(parts) > 1 and (len(flat) > 1 or index.linked_dirs.intersection(want[:-1]))):
+        # A qualified pattern is matched under each directory in walk order, the index lists files in
+        # the order their own directory is walked: with several copies only the real glob has today's
+        # order. The glob also follows a symlinked directory named in the pattern, finds a file in a
+        # directory it cannot list, and matches under another case in a case-folding directory; the
+        # index walk sees none of these.
+        flat = list(search_dir.rglob(f"{name}.md"))
+    return [smd for i in hits if os.path.lexists(smd := search_dir / index.skill_mds[i])
+            and _still_walked(smd, search_dir)], flat
+
+
 def _collect_skill_candidates(name, local_category_name, all_dirs):
     """ALL (skill_dir, skill_md) candidates across every dir and lookup strategy (direct path,
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
@@ -425,6 +717,7 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     from agent.skill_utils import iter_skill_index_files
     candidates: list[tuple[Optional[Path], Path]] = []
     seen_md: set = set()
+    checked: dict = {}  # lookup indexes already validated for this call, by real directory
 
     def _record(sd: Optional[Path], smd: Path) -> None:
         key = smd
@@ -447,13 +740,18 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
             _record_direct(search_dir / direct, search_dir)
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
-        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-            if (found_skill_md.parent.name == name
-                    or _safe_frontmatter(found_skill_md).get("name") == name):
-                _record(found_skill_md.parent, found_skill_md)
+        if (indexed := _indexed_skill_matches(search_dir, name, checked)) is not None:
+            skill_hits, flat_hits = indexed
+        else:
+            skill_hits = [
+                smd for smd in iter_skill_index_files(search_dir, "SKILL.md")
+                if smd.parent.name == name or _safe_frontmatter(smd).get("name") == name]
+            flat_hits = search_dir.rglob(f"{name}.md")
+        for found_skill_md in skill_hits:
+            _record(found_skill_md.parent, found_skill_md)
         # Legacy flat <name>.md anywhere under the dir. Markdown owned by an ancestor
         # directory skill loads through file_path and must not shadow a real skill.
-        for found_md in search_dir.rglob(f"{name}.md"):
+        for found_md in flat_hits:
             if (found_md.name != "SKILL.md" and not _is_skill_support_path(found_md)
                     and not _is_package_owned_markdown(found_md, search_dir)):
                 _record(None, found_md)
