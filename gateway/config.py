@@ -800,7 +800,7 @@ class GatewayConfig:
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: YAML .inf / -.inf
             session_store_max_age_days = 90
 
         from gateway.profile_routing import parse_profile_routes
