@@ -69,6 +69,13 @@ def _store() -> Store:
     return Store(paths.store_root())
 
 
+def _store_roots() -> tuple[Path, ...]:
+    """The roots an installed package may live in: the store, then the writable store. Resolving
+    them walks parent directories for an install stamp, so a caller that reads many packages
+    resolves them once and passes them down (``_installed_location(roots=...)``)."""
+    return (paths.store_root(), paths.writable_store_root())
+
+
 def _heal_exec_bit(binary: Path, *, heal: bool = True) -> bool:
     """Store entries staged from archives that drop the exec bit sit at 0644 and fail every
     launch with PermissionError. Modes are not part of the pinned digest, so restore it in place;
@@ -90,11 +97,13 @@ def _installed_location(package: Package, lockfile: Lockfile, target: str, *,
                         roots: tuple[Path, ...] | None = None, heal: bool = True):
     """Prefer the current pin. An explicit read may retain a prior PM install. ``heal=False``
     keeps the lookup read-only (scripts/tool_store_pins.py asks it about a store it must not touch)."""
-    search_roots = dict.fromkeys(roots if roots is not None else (paths.store_root(), paths.writable_store_root()))
+    search_roots = dict.fromkeys(roots if roots is not None else _store_roots())
     fallback = None
     for root in search_roots:
         store = Store(root)
-        facts = _facts() if root == paths.store_root() else Facts(root / "facts.json")
+        # The store's own facts file is <store>/facts.json (paths.facts_path), so every root reads
+        # its own: asking which root is the store again cost a stamp walk per package.
+        facts = Facts(root / "facts.json")
         # Every row may hold the exact pin, but only the selected (first) row may be the outdated
         # fallback, never an older pin another install keeps; a later root's fallback still
         # replaces it, as before.
@@ -1128,11 +1137,15 @@ def _store_path_dirs() -> list[str]:
 
     lockfile = _lockfile()
     target = current_target()
+    roots: tuple[Path, ...] | None = None  # resolved once per PATH, by the first package that needs them
     locations: dict[str, object] = {}
 
     def located(package):
+        nonlocal roots
         if package.name not in locations:
-            locations[package.name] = _installed_location(package, lockfile, target)
+            if roots is None:  # not once per package: every command spawn runs this
+                roots = _store_roots()
+            locations[package.name] = _installed_location(package, lockfile, target, roots=roots)
         return locations[package.name]
 
     dirs: list[str] = []
