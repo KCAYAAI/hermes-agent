@@ -2,6 +2,7 @@
 
 
 import json
+import sqlite3
 import time
 from persistence.core.errors import AuthorityRefusal
 from persistence.sqlite._state.keys import admission_fingerprint
@@ -209,35 +210,69 @@ def entry_session_id(raw):
     return value.get('session_id') if isinstance(value, dict) else None
 
 
-def _mark_retired(conn, key, *, expires, **fields):
-    # Replace: the marker is a fact, not a receipt; re-retiring an id that was recreated
-    # beside its tombstone must not abort the delete that removes it again (and restarts its horizon).
-    # An ``expires`` (sweep) marker ages out at the horizon and never shortens a permanent one.
-    # A permanent marker without ``own`` (an earlier release's, maybe another profile's shared
-    # fence) stays unscoped: it is the only fence of that profile's route. An earlier release's
-    # sweep marker came only from this store's own sweep, so it is replaced as written.
+def entry_session_id_sql(json_expr):
+    """SQL twin of :func:`entry_session_id`: the text ``session_id`` of a stored JSON object, else
+    NULL; never raises. Like ``json.loads`` it takes the LAST top-level ``session_id`` member
+    (``json_extract`` would take the first) and matches escaped keys. A non-text id (number,
+    array, object) is NULL: it names no target (the twin raised ``TypeError`` on unhashable ids
+    and aborted the whole delete; here such a malformed route is simply left alone). Each JSON
+    read sits in its own ``CASE WHEN`` because ``AND`` does not short-circuit on malformed text.
+    ``json_valid(x, 2)`` accepts JSON5 so NaN/Infinity (which ``json.dumps`` writes for float
+    nan/inf) parse as they do for ``json.loads``; other JSON5-only syntax (comments, unquoted
+    keys) is never written by ``json.dumps``."""
+    last_id = (f"(SELECT CASE WHEN j.type = 'text' THEN j.value END FROM json_each({json_expr}) AS j "
+               "WHERE j.key = 'session_id' ORDER BY j.id DESC LIMIT 1)")
+    # The flags argument of json_valid needs SQLite 3.45; an older library keeps strict JSON (NaN
+    # entries are then left alone, as before this change) instead of failing every retirement.
+    valid = f"json_valid({json_expr}, 2)" if sqlite3.sqlite_version_info >= (3, 45, 0) else f"json_valid({json_expr})"
+    return (f"(CASE WHEN {valid} THEN CASE WHEN json_type({json_expr}) = 'object' "
+            f"THEN {last_id} END END)")
+
+
+def _mark_retired_many(conn, keys, *, expires, **fields):
+    """Write the retirement marker of every key in ONE statement (KC: set-based, one shared
+    ``retired_at``), so a bulk delete or prune does not step once per id under the writer mutex.
+
+    Replace: the marker is a fact, not a receipt; re-retiring an id that was recreated beside its
+    tombstone must not abort the delete that removes it again (and restarts its horizon). An
+    ``expires`` (sweep) marker ages out at the horizon and never shortens a permanent one. A
+    permanent marker without ``own`` (an earlier release's, maybe another profile's shared fence)
+    stays unscoped: it is the only fence of that profile's route. An earlier release's sweep marker
+    came only from this store's own sweep, so it is replaced as written."""
+    keys = sorted(set(keys))
+    if not keys:
+        return
     value = {'retired_at': time.time(), **fields}
+    batch = json.dumps(keys, ensure_ascii=False)
     if expires:
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+        conn.execute('INSERT INTO state_meta(key,value) SELECT j.value, ? FROM json_each(?) AS j WHERE true '
+                     'ON CONFLICT(key) DO UPDATE '
                      "SET value=excluded.value WHERE json_valid(state_meta.value) "
                      "AND json_extract(state_meta.value, '$.expires')",
-                     (key, json.dumps({**value, 'expires': True})))
+                     (json.dumps({**value, 'expires': True}), batch))
     else:
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=CASE '
+        conn.execute('INSERT INTO state_meta(key,value) SELECT j.value, ? FROM json_each(?) AS j WHERE true '
+                     'ON CONFLICT(key) DO UPDATE SET value=CASE '
                      "WHEN NOT json_valid(state_meta.value) THEN json_remove(excluded.value, '$.own') "
                      "WHEN json_extract(state_meta.value, '$.own') IS NOT NULL "
                      "OR json_extract(state_meta.value, '$.expires') THEN excluded.value "
-                     "ELSE json_remove(excluded.value, '$.own') END", (key, json.dumps(value)))
+                     "ELSE json_remove(excluded.value, '$.own') END", (json.dumps(value), batch))
+
+
+def _mark_retired(conn, key, *, expires, **fields):
+    """One key's retirement marker: :func:`_mark_retired_many` of that key alone."""
+    _mark_retired_many(conn, [key], expires=expires, **fields)
 
 
 def retire_routes(conn, session_ids, *, expiring=()):
-    expiring = set(expiring)
-    for sid in session_ids:
-        _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid in expiring, own=True)
-        conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
-        conn.execute('DELETE FROM state_meta WHERE key=?', (VIEWER_CLOSE_PREFIX + sid,))
-    targets = set(session_ids)
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if entry_session_id(row['entry_json']) in targets:
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+    # Set-based (KC): a fixed handful of statements whatever the number of ids or routes.
+    ids, expiring = set(session_ids), set(expiring)
+    _mark_retired_many(conn, [RETIRED_PREFIX + sid for sid in ids if sid in expiring], expires=True, own=True)
+    _mark_retired_many(conn, [RETIRED_PREFIX + sid for sid in ids if sid not in expiring], expires=False, own=True)
+    gone = [prefix + sid for sid in ids for prefix in ('gateway.api.settings.v1.', VIEWER_CLOSE_PREFIX)]
+    conn.execute('DELETE FROM state_meta WHERE key IN (SELECT value FROM json_each(?))',
+                 (json.dumps(sorted(gone), ensure_ascii=False),))
+    # Set-based (KC): one statement, not one Python step per routing row under the writer mutex
+    # (the per-row scan convoys on the GIL in a busy multiplex gateway).
+    conn.execute(f'DELETE FROM gateway_routing WHERE {entry_session_id_sql("entry_json")} '
+                 'IN (SELECT value FROM json_each(?))', (json.dumps(sorted(set(session_ids))),))
