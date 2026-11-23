@@ -18,7 +18,7 @@ def _note(platform):
 
 def test_slack_is_told_the_umbrella_discard_command():
     note = _note(Platform.SLACK)
-    assert "/hermes discard" in note and "/resume sid-1" in note
+    assert "!discard" in note and "/resume sid-1" in note
 
 
 def test_telegram_is_told_the_native_discard_command():
@@ -27,7 +27,7 @@ def test_telegram_is_told_the_native_discard_command():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("platform,discard", [(Platform.SLACK, "/hermes discard"), (Platform.TELEGRAM, "/discard")])
+@pytest.mark.parametrize("platform,discard", [(Platform.SLACK, "!discard"), (Platform.TELEGRAM, "/discard")])
 async def test_reset_reply_names_the_platform_discard_command(monkeypatch, platform, discard):
     """The /new handler itself fills {discard} per platform, not only the helper."""
     from datetime import datetime

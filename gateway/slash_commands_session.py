@@ -199,8 +199,9 @@ async def paused_followers(runner, session_id) -> int:
 
 
 def discard_command_for(source) -> str:
-    """The lost-turn discard command this chat can send: Slack registers no native ``/discard``."""
-    return '/hermes discard' if getattr(getattr(source, 'platform', None), 'value', None) == 'slack' else '/discard'
+    """The lost-turn discard command this chat can send: Slack registers no native ``/discard`` and
+    rejects slash commands inside a thread; KC: the adapter rewrites a leading ``!discard`` anywhere."""
+    return '!discard' if getattr(getattr(source, 'platform', None), 'value', None) == 'slack' else '/discard'
 
 
 class GatewaySessionCommandsMixin:
