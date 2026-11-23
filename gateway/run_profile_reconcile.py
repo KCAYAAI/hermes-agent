@@ -268,6 +268,9 @@ class GatewayProfileReconcileMixin(GatewayPlatformReconcileMixin):
             reason_ = await self._serve_profile_runtime(name, live[name])
             if reason_ is not None:
                 added.remove(name)
+                # The serve verb put the name in ``current``; a refused serve must not be
+                # recorded as served (no adapter would start and later serves see "already served").
+                current.pop(name, None)
                 park_profile(self, name, reason_)
                 result["parked"].append(name)
                 continue
