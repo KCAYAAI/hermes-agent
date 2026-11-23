@@ -268,6 +268,10 @@ CREATE TABLE IF NOT EXISTS session_admissions (
     outcome TEXT,
     owner_epoch INTEGER,
     generation INTEGER,
+    -- KC (rollback window): the messages.id high-water mark at the claim that started this row, as KC release
+    -- r34 declared and wrote it (NULL before a claim). Only r34's restart recovery reads it; kept so a rollback
+    -- to r34 reads real marks for rows claimed under this release. Retire with r34 as a rollback target.
+    transcript_mark INTEGER,
     UNIQUE (principal_id, target_session_id, request_id),
     CHECK (status != 'started' OR (owner_epoch IS NOT NULL AND generation IS NOT NULL))
 );
