@@ -199,8 +199,18 @@ async def paused_followers(runner, session_id) -> int:
 
 
 def discard_command_for(source) -> str:
-    """The lost-turn discard command this chat can send: Slack registers no native ``/discard``."""
-    return '/hermes discard' if getattr(getattr(source, 'platform', None), 'value', None) == 'slack' else '/discard'
+    """The lost-turn discard command this chat can send: Slack registers no native ``/discard`` and
+    rejects slash commands inside a thread; KC: the adapter rewrites a leading ``!discard`` anywhere."""
+    return '!discard' if getattr(getattr(source, 'platform', None), 'value', None) == 'slack' else '/discard'
+
+
+def paused_left_notice(source, **fields) -> str:
+    """``gateway.reset.paused_left`` for *source*. KC: on Slack its ``/resume <id>`` becomes ``!resume <id>``,
+    because Slack rejects slash commands inside a thread; the adapter rewrites a leading ``!cmd``."""
+    text = t("gateway.reset.paused_left", discard=discard_command_for(source), **fields)
+    if getattr(getattr(source, 'platform', None), 'value', None) == 'slack':
+        text = text.replace('/resume ', '!resume ')
+    return text
 
 
 class GatewaySessionCommandsMixin:
@@ -357,8 +367,8 @@ class GatewaySessionCommandsMixin:
         body = f"{header}\n\n{session_info}" if session_info else header
         if paused_count:
             from gateway.session_authorities import active_authority
-            body += t("gateway.reset.paused_left", count=paused_count, discard=discard_command_for(source),
-                      session_id=active_authority(self).logical_owner(_old_sid))
+            body += paused_left_notice(source, count=paused_count,
+                                       session_id=active_authority(self).logical_owner(_old_sid))
         return EphemeralReply(f"{body}{_tip_line}")
 
     async def _reset_titled_header(self, header: str, session_id: str, title_arg: str) -> str:
@@ -1267,8 +1277,7 @@ class GatewaySessionCommandsMixin:
         self._evict_cached_agent(session_key)
         title = await store.aio.sessions.get_title(target_id) or name
         await self._rename_telegram_topic_after_switch(source, new_entry, title)
-        left_notice = (t("gateway.reset.paused_left", count=left_count,
-                         session_id=current_entry.session_id, discard=discard_command_for(source))
+        left_notice = (paused_left_notice(source, count=left_count, session_id=current_entry.session_id)
                        if left_count else "")
         try:
             history = await self.async_session_store.load_transcript(target_id)

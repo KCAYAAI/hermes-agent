@@ -18,7 +18,7 @@ def test_slack_pause_notice_names_the_registered_umbrella_command():
     from hermes_cli.commands_platforms import slack_native_slashes, slack_subcommand_map
     assert 'discard' not in [row[0].lstrip('/') for row in slack_native_slashes()]
     assert slack_subcommand_map().get('discard')
-    for platform, expected in ((Platform.SLACK, '/hermes discard'), (Platform.TELEGRAM, 'Send /discard')):
+    for platform, expected in ((Platform.SLACK, 'Send !discard'), (Platform.TELEGRAM, 'Send /discard')):
         live = SimpleNamespace(source=SessionSource(platform=platform, chat_id='D42'), pause_notified=False)
         notice = pause_notice(SimpleNamespace(sessions={'s': live}), SessionRef('p', 's'), 'unknown_execution')
         assert expected in notice, notice
