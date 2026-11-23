@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
 import time
@@ -151,6 +150,7 @@ class GatewaySessionWatchersMixin(GatewayAutoResumeMixin):
         """Run the claimed cache-edge *action* on one idle chat: ``compact`` through the manual
         ``/compress`` pipeline (temporary agent, compression lease, persist, evict) with an automatic
         trigger, ``offload`` through the cold prune; in the chat's profile scope."""
+        from gateway.session_runtime_workers import track_mutation
         claimed_session = getattr(live_agent, "session_id", None)
         async with slots:
             try:
@@ -159,14 +159,51 @@ class GatewaySessionWatchersMixin(GatewayAutoResumeMixin):
                 # window checked below belong to the old chat, not the one the route now serves.
                 if entry is None or entry.origin is None or entry.session_id != claimed_session:
                     return
-                with self._profile_scope_for_source(entry.origin):
-                    live = authority.sessions.get(owner) if authority is not None else None
-                    # The FIFO claim waits on ``claim_gate`` (as behind ``/compress``): a message
-                    # arriving mid-summary starts its turn on the compacted history, not the old one.
-                    async with live.claim_gate if live is not None else contextlib.nullcontext():
+                if authority is None:
+                    if self._runs_session_authorities():
+                        # The key's profile is unserved or retiring: no claim gate to hold.
+                        logger.debug("Cache-expiry work skipped for %s: no serving authority", key)
+                        return
+                    with self._profile_scope_for_source(entry.origin):
                         await self._compact_claimed_session(key, entry, live_agent, action)
+                    return
+                # Retirement sets ``retiring`` and then joins the authority's tracked work: register
+                # in this same loop step, or never start. A successor's claim takes its own gate, so
+                # only the join keeps this write ahead of it.
+                if getattr(authority, "retiring", False) or getattr(authority, "retired", False):
+                    logger.debug("Cache-expiry work skipped for %s: its authority is retiring", key)
+                    return
+                await track_mutation(authority, self._cache_edge_under_claim_gate(
+                    key, entry, owner, authority, live_agent, action))
             except Exception as e:
                 logger.warning("Cache-expiry compaction failed for %s: %s", key, e, exc_info=True)
+
+    def _runs_session_authorities(self) -> bool:
+        """Whether turns on this runner are claimed through session authorities (one, or a
+        multiplex registry), so cache-edge work must hold an authority's claim gate."""
+        return (getattr(self, "session_authorities", None) is not None
+                or getattr(self, "session_authority", None) is not None)
+
+    async def _cache_edge_under_claim_gate(self, key: str, entry, owner, authority, live_agent,
+                                           action: str) -> None:
+        """The cache-edge *action* under the owner's ``claim_gate``, as work of *authority*."""
+        from gateway.session_persistence import authority_persistence
+        with self._profile_scope_for_source(entry.origin):
+            live = authority.sessions.get(owner)
+            if live is None:
+                logger.debug("Cache-expiry work skipped for %s: no live session gate", key)
+                return  # no gate to serialize the FIFO claim against: never run ungated
+            # The FIFO claim waits on ``claim_gate`` (as behind ``/compress``): a message arriving
+            # mid-summary starts its turn on the compacted history, not the old one.
+            async with live.claim_gate:
+                # A claim that won the gate first runs before the runner's sentinel is installed
+                # (``_is_session_running`` reads idle); a write now would land after its transcript
+                # mark and read as the turn's own on restart.
+                if await asyncio.to_thread(authority_persistence(authority).admissions.has_pending,
+                                           session_ids=(owner,), statuses=frozenset({'started', 'unknown'})):
+                    logger.debug("Cache-expiry work skipped for %s: a claimed turn is pending", key)
+                    return
+                await self._compact_claimed_session(key, entry, live_agent, action)
 
     def _cache_expiry_route(self, key: str):
         """``(authority, entry, owner session id)`` for *key*. Under an authority the entry may be a
