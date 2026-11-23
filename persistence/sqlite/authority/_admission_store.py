@@ -176,14 +176,18 @@ def claim_session_input(holder, *, epoch: int, session_id: str, gate=None, head=
             return None
         generation = session['runtime_generation'] + 1
         conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation, session_id))
-        changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=? WHERE admission_id=? AND status='queued'", (epoch, generation, row['admission_id']))
+        # KC rollback window: r34 reads the durable mark. Store it in the fenced claim itself,
+        # not a best-effort follow-up. Any SQLite failure must roll back and refuse the claim.
+        mark = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        changed = conn.execute("UPDATE session_admissions SET status='started',owner_epoch=?,generation=?,transcript_mark=? "
+                               "WHERE admission_id=? AND status='queued'", (epoch, generation, mark, row['admission_id']))
         if changed.rowcount != 1:
             raise AuthorityRefusal('stale_generation')
         claimed = _row(_admission(conn, row['admission_id']))
         # The transcript high-water mark at the claim (``messages.id`` is AUTOINCREMENT across every
         # session): a row above it on this conversation was written by this turn, so settlement can
         # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
-        claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        claimed['transcript_mark'] = mark
         claimed['queued_owner_epoch'] = row['owner_epoch']
         return claimed
     return holder._execute_write(write)
@@ -212,7 +216,7 @@ def return_session_claim(holder, *, epoch: int, admission_id: str, generation: i
                                 "AND outcome=? AND owner_epoch=? AND generation=? LIMIT 1",
                                 (row['target_session_id'], STEERING, epoch, generation)).fetchone()):
             raise AuthorityRefusal('stale_generation')
-        conn.execute("UPDATE session_admissions SET status='queued',owner_epoch=?,generation=NULL "
+        conn.execute("UPDATE session_admissions SET status='queued',owner_epoch=?,generation=NULL,transcript_mark=NULL "
                      "WHERE admission_id=? AND status='started'", (queued_owner_epoch, admission_id))
         conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation - 1, row['target_session_id']))
         return _row(_admission(conn, admission_id))
