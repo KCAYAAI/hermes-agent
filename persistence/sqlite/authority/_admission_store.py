@@ -8,6 +8,7 @@ values and run at a fixed point inside that transaction; their bodies live in :m
 
 from __future__ import annotations
 
+import contextlib
 import heapq
 import json
 import uuid
@@ -149,6 +150,21 @@ def latest_session_admission(holder, *, session_id: str, payload_marker: str) ->
 _ANY_HEAD = object()
 
 
+def _kc_store_r34_transcript_mark(holder, conn, admission_id, mark) -> None:
+    """KC (rollback window): a store that KC release r34 used has a nullable
+    ``session_admissions.transcript_mark`` column. Write the claim's mark there in the claim's own
+    transaction, as r34 did, so an r34 restart recovery after a rollback reads this claim's real mark
+    instead of NULL. A store without the column (created after r34) is left untouched. Retire this when
+    a rollback to r34 is no longer possible."""
+    has = getattr(holder, '_kc_r34_transcript_mark', None)
+    if has is None:
+        has = any(col[1] == 'transcript_mark' for col in conn.execute('PRAGMA table_info(session_admissions)'))
+        with contextlib.suppress(AttributeError):
+            holder._kc_r34_transcript_mark = has
+    if has:
+        conn.execute('UPDATE session_admissions SET transcript_mark=? WHERE admission_id=?', (mark, admission_id))
+
+
 def claim_session_input(holder, *, epoch: int, session_id: str, gate=None, head=_ANY_HEAD) -> dict | bool | None:
     """Claim the FIFO head. ``gate`` (the owner's ``GateRefusal``, or a callable answered here on every attempt)
     refuses right after the epoch fence. ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing queued); if
@@ -183,6 +199,7 @@ def claim_session_input(holder, *, epoch: int, session_id: str, gate=None, head=
         # session): a row above it on this conversation was written by this turn, so settlement can
         # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
         claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
+        _kc_store_r34_transcript_mark(holder, conn, row['admission_id'], claimed['transcript_mark'])
         claimed['queued_owner_epoch'] = row['owner_epoch']
         return claimed
     return holder._execute_write(write)
