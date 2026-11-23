@@ -1,0 +1,121 @@
+"""#145215: forwarding a prompt needs an attachment, not the owner's large transcript.
+
+Exercises forward_prompt, its relay thread, real SQLite history, authority
+resume/admission/settlement, a loopback WebSocket and GatewayClient. Discovery,
+ticket issuance and turn execution are replaced; no LLM runs.
+"""
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+from websockets.asyncio.server import serve
+
+from gateway.session_authority import LiveSession, SessionAuthority, admission_row
+from gateway.session_contract import SessionRef
+from gateway.session_controls import AuthorityConnection
+from gateway.session_settlement_recovery import commit_and_publish
+from hermes_cli import gateway_client
+from persistence import SessionId
+from persistence.conversation.messages import NewMessage
+from persistence.conversation.sessions import NewSession
+from persistence_assembly import open_persistence, profile_scope
+from tui_gateway import owner_forward
+
+
+class _Socket:
+    def __init__(self):
+        self.frames = []
+
+    def write(self, frame):
+        self.frames.append(frame)
+        return True
+
+    def close(self):
+        return None
+
+    async def flush(self, ws):
+        while self.frames:
+            await ws.send(json.dumps(self.frames.pop(0)))
+
+
+@pytest.mark.asyncio
+async def test_long_history_forward_admits_once_and_relays_completion(tmp_path, monkeypatch):
+    from gateway import session_local_recovery
+
+    # KC port (r35): upstream main replaced SessionDB / hermes_state_runtime with the persistence handle.
+    db = open_persistence(profile_scope(home=tmp_path))
+    key, emitted, resumes, history_reads = "long-chat", [], [], []
+    loop = asyncio.get_running_loop()
+    completed, disconnected = asyncio.Event(), asyncio.Event()
+    db.sessions.create(NewSession(session_id=key, source="test"))
+    for _ in range(9):
+        db.messages.append(SessionId(key), NewMessage(role="user", content="x" * (1024 * 1024)))
+    epoch = db.runtime.begin_epoch(instance_id="gateway")
+    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id="owned",
+                                 instance_id="gateway", epoch=epoch, persistence=db)
+    authority.sessions[key] = LiveSession(SimpleNamespace(platform=None, user_id="desktop"), "route")
+    monkeypatch.setattr(authority, "_schedule", lambda ref: None)
+    monkeypatch.setattr(gateway_client, "_session_ticket", lambda *a, **kw: "fixture-ticket")
+    original_read = session_local_recovery.display_rows
+
+    def read_history(*args):
+        history_reads.append(True)
+        return original_read(*args)
+
+    monkeypatch.setattr(session_local_recovery, "display_rows", read_history)
+
+    def emit(event, sid, payload):
+        emitted.append((event, sid, payload))
+        if event == "message.complete":
+            loop.call_soon_threadsafe(completed.set)
+
+    async def handler(ws):
+        transport = _Socket()
+        conn = AuthorityConnection(authority, transport, {"user_id": "desktop"})
+        try:
+            async for raw in ws:
+                request = json.loads(raw)
+                reply = await conn.dispatch(request)
+                if request["method"] == "session.resume":
+                    resumes.append(reply)
+                await ws.send(json.dumps(reply))
+                if request["method"] == "prompt.submit" and "result" in reply:
+                    row = admission_row(db.admissions.claim(epoch=epoch, session_id=key))
+                    ref, live = SessionRef("owned", key), authority.sessions[key]
+                    authority._stamp_claim(ref, live, row)
+                    with live.event_stream.lock:
+                        authority.executing.pop(key, None)
+                    commit_and_publish(authority, live, ref, row, "THE ANSWER", "completed", None, {})
+                await transport.flush(ws)
+        finally:
+            await conn.close()
+            disconnected.set()
+
+    try:
+        async with serve(handler, "127.0.0.1", 0,
+                         subprotocols=[gateway_client.GATEWAY_WS_PROTOCOL]) as listener:
+            port = listener.sockets[0].getsockname()[1]
+            endpoint = SimpleNamespace(api_origin=f"http://127.0.0.1:{port}")
+            monkeypatch.setattr(owner_forward, "discover_owner", lambda _home: endpoint)
+            session = {"session_key": key, "profile_home": str(tmp_path)}
+            receipt = await asyncio.wait_for(asyncio.to_thread(
+                owner_forward.forward_prompt, "ui", session, "my question", emit=emit), timeout=10)
+            await asyncio.wait_for(completed.wait(), timeout=10)
+            await asyncio.wait_for(disconnected.wait(), timeout=10)
+
+        assert history_reads == []  # No full-history read hidden behind a small wire reply.
+        assert len(resumes) == 1 and len(json.dumps(resumes[0]).encode()) < 64 * 1024
+        assert resumes[0]["result"]["messages"] == []
+        assert resumes[0]["result"]["messages_omitted"] is True
+        assert resumes[0]["result"]["message_count"] == 9
+        rows = db.admissions.list(session_id=key, pending_only=False)
+        assert len(rows) == 1 and rows[0].status == "terminal"
+        assert rows[0].admission_id == receipt["admission_id"]
+        assert rows[0].payload["text"] == "my question"
+        assert all(sid == "ui" for _event, sid, _payload in emitted)
+        messages = [(event, payload) for event, sid, payload in emitted if event.startswith("message.")]
+        assert messages[0][0] == "message.start"
+        assert messages[-1] == ("message.complete", {"text": "THE ANSWER", "status": "complete"})
+    finally:
+        db.close()
