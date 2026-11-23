@@ -5,30 +5,31 @@ reaches it, as the lost-turn pause notice already tells Slack users.
 """
 import pytest
 
-from agent.i18n import t
 from gateway.config import Platform
 from gateway.session import SessionSource
-from gateway.slash_commands_session import discard_command_for
+from gateway.slash_commands_session import discard_command_for, paused_left_notice
 
 
 def _note(platform):
     source = SessionSource(platform=platform, chat_id="c1", chat_type="dm", user_id="u1")
-    return t("gateway.reset.paused_left", count=2, session_id="sid-1", discard=discard_command_for(source))
+    return paused_left_notice(source, count=2, session_id="sid-1")
 
 
 def test_slack_is_told_the_umbrella_discard_command():
     note = _note(Platform.SLACK)
-    assert "/hermes discard" in note and "/resume sid-1" in note
+    # KC: Slack rejects slash commands inside a thread; the adapter rewrites a leading !cmd.
+    assert "!resume sid-1, then !discard" in note and "/resume" not in note
 
 
 def test_telegram_is_told_the_native_discard_command():
     note = _note(Platform.TELEGRAM)
-    assert "then /discard" in note and "/hermes" not in note
+    assert "/resume sid-1, then /discard" in note and "/hermes" not in note
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("platform,discard", [(Platform.SLACK, "/hermes discard"), (Platform.TELEGRAM, "/discard")])
-async def test_reset_reply_names_the_platform_discard_command(monkeypatch, platform, discard):
+@pytest.mark.parametrize("platform,resume,discard", [(Platform.SLACK, "!resume", "!discard"),
+                                                    (Platform.TELEGRAM, "/resume", "/discard")])
+async def test_reset_reply_names_the_platform_discard_command(monkeypatch, platform, resume, discard):
     """The /new handler itself fills {discard} per platform, not only the helper."""
     from datetime import datetime
     from types import SimpleNamespace
@@ -62,4 +63,4 @@ async def test_reset_reply_names_the_platform_discard_command(monkeypatch, platf
     monkeypatch.setattr(authorities, "active_authority", lambda _runner: MagicMock(logical_owner=lambda sid: sid, sessions={}))
 
     reply = await runner._handle_reset_command(MessageEvent(text="/new", source=source, message_id="m1"))
-    assert "/resume sid-1" in reply and f"then {discard}." in reply, reply
+    assert f"{resume} sid-1, then {discard}." in reply, reply

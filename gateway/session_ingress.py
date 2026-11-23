@@ -274,11 +274,13 @@ def pause_notice(authority, ref, reason):
         # GW-10: the way out is in this chat. /discard acknowledges the lost turn (never replayed)
         # through the same fenced resolve_unknown as Desktop/TUI, and the saved messages then run.
         # Slack registers no native /discard (its slash cap): the umbrella `/hermes discard` reaches it.
+        # KC: Slack rejects slash commands inside a thread, where this notice is usually read; the
+        # adapter rewrites a leading `!discard` / `!reset` (after a bot mention too) to the command.
         slack = getattr(getattr(live.source, 'platform', None), 'value', None) == 'slack'
-        discard = '/hermes discard' if slack else '/discard'
+        discard, reset = ('!discard', '!reset') if slack else ('/discard', '/reset')
         return ('⏸️ This conversation is paused: a previous turn did not finish when Hermes restarted, '
                 f'and only you know whether to send it again. Your message is saved. Send {discard} to drop '
-                'the lost turn and continue (it is not re-run), or /reset to start a fresh conversation.')
+                f'the lost turn and continue (it is not re-run), or {reset} to start a fresh conversation.')
     cause = f'a queued message could not be re-authorized ({reason})'
     return (f'⏸️ This conversation is paused: {cause}. Your message is saved but will not be answered here. '
             'Send /reset to start a fresh conversation, or ask the operator to resume this one.')
