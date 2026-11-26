@@ -50,11 +50,28 @@ def config_set_live_note(key: str) -> Optional[str]:
         lines.append(f"  ⚠ Running gateway did not apply it: {answer.get('error')}")
     elif answer.get("pending"):
         lines.append(_pending_note(answer))
+    elif answer.get("reason") == "restart_needed":
+        # KC: this save was held; what the same answer reports started or stopped came from earlier work.
+        applied = _live_note(answer).replace(_APPLIED_NOW, "Running gateway changes since the last report:")
+        lines += [applied, _held_note(answer)]
+        if not applied:
+            lines.append(_unserved_note(key, answer, get_hermes_home()))
     elif answer.get("changed"):
         lines.append(_live_note(answer))
     elif not lines:
         lines.append(_unserved_note(key, answer, get_hermes_home()))
     return "\n".join(line for line in lines if line) or None
+
+
+def _held_note(answer: dict) -> str:
+    """KC (gateway.platform_hot_restart: false): the gateway keeps a running platform as it is until it
+    restarts. A held change is reported on every answer until then, whichever key this save set, so the
+    line names the platform's pending change, not this save."""
+    if answer.get("reason") != "restart_needed":
+        return ""
+    held = sorted(p for p, why in (answer.get("reasons") or {}).items() if "platform_hot_restart" in str(why))
+    return (f"  Running gateway: a change to {', '.join(held) or 'a running platform'} is waiting for a gateway "
+            "restart (gateway.platform_hot_restart is false).")
 
 
 def _unserved_note(key: str, answer: dict, home: Path) -> str:
@@ -99,6 +116,9 @@ def _pending_note(answer: dict) -> str:
     return f"  Running gateway is {'; '.join(parts)} ({still})"
 
 
+_APPLIED_NOW = "Running gateway applied it now:"
+
+
 def _live_note(answer: dict) -> str:
     """One truthful line per outcome from the gateway's own verdict: what it now serves, then (separately)
     what it tried and could not bring up, with its reason when it gave one."""
@@ -108,6 +128,6 @@ def _live_note(answer: dict) -> str:
     parts = [f"{verb} {', '.join(applied)}" for verb, names in (
         ("started", answer.get("started")), ("restarted", answer.get("restarted")),
         ("stopped", answer.get("stopped"))) if (applied := [p for p in names or () if p not in down])]
-    lines = [f"  Running gateway applied it now: {'; '.join(parts)}"] if parts else []
+    lines = [f"  {_APPLIED_NOW} {'; '.join(parts)}"] if parts else []
     lines += [f"  ⚠ Running gateway could not start {p}: {reasons.get(p) or 'see `hermes logs`'}" for p in down]
     return "\n".join(lines)
