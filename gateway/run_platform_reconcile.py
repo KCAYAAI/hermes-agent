@@ -119,6 +119,7 @@ class PlatformPlan:
     restart: tuple
     stop: tuple
     forget: tuple = ()
+    held: tuple = ()  # KC: restarts/stops held for the next gateway restart (gateway.platform_hot_restart off)
 
     def __bool__(self) -> bool:
         return bool(self.start or self.restart or self.stop)
@@ -136,6 +137,62 @@ def plan_platform_changes(wanted: dict, built: dict, live) -> PlatformPlan:
         stop=tuple(p for p in gone if p in live),
         forget=tuple(p for p in gone if p not in live),
     )
+
+
+def read_platform_hot_restart(home) -> bool:
+    """KC, blocking; called once per gateway process, off-loop, before any adapter is built.
+    ``gateway.platform_hot_restart`` from ``home/config.yaml`` (the install owner's file, by explicit path,
+    opened and parsed here with no shared config cache or lock). True only when the file is absent
+    (FileNotFoundError on open) or is a mapping that leaves the key unset or empty (upstream's behavior).
+    False for false, 0, "false", "off", "no", "0", and for every other outcome: a failed open or stat for
+    any other reason, an unreadable or non-mapping document. Never raises."""
+    try:
+        import hermes_yaml
+        with open(Path(home) / "config.yaml", encoding="utf-8-sig") as handle:
+            config = hermes_yaml.safe_load(handle.read())
+    except FileNotFoundError:
+        return True
+    except Exception:  # health: allow BLE001 -- any other failed read keeps the running adapters
+        return False
+    try:
+        if not isinstance(config, dict):
+            return False
+        section = config.get("gateway")
+        value = section.get("platform_hot_restart") if isinstance(section, dict) else None
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in ("false", "0", "no", "off")
+        return bool(value)
+    except Exception:  # health: allow BLE001 -- an odd value keeps the running adapters
+        return False
+
+
+def hold_live_adapters(plan: PlatformPlan, profile: str, hot_restart: bool) -> PlatformPlan:
+    """KC: unless ``hot_restart`` is True, drop the restarts and stops from ``plan`` and name them in
+    ``held``. Upstream drains in-flight turns for at most ``agent.restart_drain_timeout`` before it replaces
+    an adapter; a longer KC turn, and the reply, reaction and progress-card work the KC Slack carries do
+    after it, would be cut off. The change applies at the next gateway restart. Starts are unaffected."""
+    if not (plan.restart or plan.stop) or hot_restart is True:
+        return plan
+    held = (*plan.restart, *plan.stop)
+    logger.warning("Platform reconcile: profile '%s' changed %s; gateway.platform_hot_restart is false, so the "
+                   "running adapter is kept and the change applies at the next gateway restart", profile,
+                   [p.value for p in held])
+    return PlatformPlan(start=plan.start, restart=(), stop=(), forget=plan.forget, held=held)
+
+
+def _defer_held(receipt: dict, plan: Optional[PlatformPlan]) -> dict:
+    """KC: a receipt whose plan held a platform says so: ``applied`` False is the verb's "only a restart
+    applies the save", and each held platform gets its reason."""
+    if plan is None or not plan.held:
+        return receipt
+    receipt["applied"] = False
+    receipt["reason"] = "restart_needed"
+    receipt["reasons"] = {**(receipt.get("reasons") or {}), **{
+        p.value: "gateway.platform_hot_restart is false: the running adapter is kept until the gateway restarts"
+        for p in plan.held}}
+    return receipt
 
 
 def _turn_platform(session_key: str) -> str:
@@ -330,6 +387,14 @@ class GatewayPlatformReconcileMixin:
         baseline, so an edit landing during a slow startup reads as a change at the watcher's start."""
         from gateway.run_profile_reconcile import profile_serve_signature
         home = self._primary_platform_home()
+        if getattr(self, "_kc_platform_hot_restart", None) is None:
+            # KC: the owner's switch, sampled exactly once per process (a later baseline retry from the
+            # watcher never re-reads it), before any adapter is built. A failed sample stays False (hold).
+            self._kc_platform_hot_restart = False
+            with _log_suppressed(logging.WARNING, "gateway.platform_hot_restart read failed", exc_info=True):
+                self._kc_platform_hot_restart = await asyncio.to_thread(read_platform_hot_restart, home) is True
+            logger.info("Platform reconcile: gateway.platform_hot_restart is %s for this gateway process",
+                        "true" if self._kc_platform_hot_restart else "false")
         with _log_suppressed(logging.DEBUG, "primary platform baseline failed", exc_info=True):
             self._primary_credential_print = await asyncio.to_thread(_credential_print, home)
             self._primary_dotenv = await asyncio.to_thread(_read_dotenv, home)
@@ -370,6 +435,11 @@ class GatewayPlatformReconcileMixin:
             return
         task = asyncio.ensure_future(self.reconcile_profile_platforms(profile_name, reason=reason))
         self._retain_background_task(task)
+
+    def _kc_hold_live_adapters(self, plan: PlatformPlan, profile: str) -> PlatformPlan:
+        """KC: ``hold_live_adapters`` with the switch boot read once for the process; nothing is read here.
+        A runner that never recorded the switch holds (off)."""
+        return hold_live_adapters(plan, profile, getattr(self, "_kc_platform_hot_restart", False) is True)
 
     # ── reconcile ────────────────────────────────────────────────────────────────────────────────
 
@@ -422,8 +492,11 @@ class GatewayPlatformReconcileMixin:
         # The plugin recovery's install marker is this apply's own write to config.yaml, not an edit.
         self._primary_platform_signature = signature if own_write is None else (own_write, *signature[1:])
         self._unreadable_platform_configs.pop(primary, None)
-        return self._recorded(_receipt(primary, plan.start, plan.restart, plan.stop, self._primary_platform_states(),
-                                       dict(getattr(self, "_primary_blocked_platforms", None) or {}), installed))
+        # KC: a held restart/stop is reported before the ledger records the receipt (gateway.platform_hot_restart).
+        return self._recorded(_defer_held(_receipt(primary, plan.start, plan.restart, plan.stop,
+                                                   self._primary_platform_states(),
+                                                   dict(getattr(self, "_primary_blocked_platforms", None) or {}),
+                                                   installed), plan))
 
     def _recorded(self, receipt: dict) -> dict:
         self.platform_change_ledger.record(receipt)
@@ -477,7 +550,8 @@ class GatewayPlatformReconcileMixin:
                 continue
             started = tuple(p for p in self._secondary_running_platforms(name)
                             if p not in was and p not in plan.restart)
-            receipts[name] = self._recorded(_receipt(name, started, plan.restart, plan.stop, states, {}, installed))
+            receipts[name] = self._recorded(_defer_held(  # KC: held restarts/stops, before the ledger records
+                _receipt(name, started, plan.restart, plan.stop, states, {}, installed), plan))
         return receipts
 
     def platform_plan_in_flight(self, profile_name: Optional[str]) -> Optional[PlatformPlan]:
@@ -634,6 +708,7 @@ class GatewayPlatformReconcileMixin:
             built = self._primary_build_prints = {}
         live = {*self.adapters, *(getattr(self, "_failed_platforms", None) or {})}
         plan = plan_platform_changes({p: bp for p, (_c, bp) in wanted.items()}, built, live)
+        plan = self._kc_hold_live_adapters(plan, getattr(self, "_primary_profile_name", None) or "default")
         for platform in plan.forget:
             built.pop(platform, None)
         # Runner-read settings (the home channel) are live at once, whatever the adapter plan says.
@@ -730,6 +805,7 @@ class GatewayPlatformReconcileMixin:
         wanted = await asyncio.to_thread(
             ctx.run, lambda: {p: self._secondary_build_print(profile_home, p, c) for p, c in wanted_cfg.items()})
         plan = plan_platform_changes(wanted, built, {*profile_map, *queued})
+        plan = self._kc_hold_live_adapters(plan, profile_name)
         for platform in plan.forget:
             built.pop(platform, None)
         plans = getattr(self, "_profile_platform_plans", None)
